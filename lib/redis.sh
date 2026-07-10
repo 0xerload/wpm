@@ -471,13 +471,26 @@ redis_sync_lscwp() {
 
   # LSCWP object-cache option keys — single array, easy to retune per
   # plugin version without touching the sync logic below.
+  #
+  # These are the ACTUAL option IDs (verified directly against
+  # litespeedtech/lscache_wp's src/base.cls.php constant definitions —
+  # O_OBJECT='object', O_OBJECT_KIND='object-kind', O_OBJECT_HOST=
+  # 'object-host', O_OBJECT_PORT='object-port', O_OBJECT_USER='object-user',
+  # O_OBJECT_PSWD='object-pswd', O_OBJECT_DB_ID='object-db_id' — NOT the
+  # earlier guessed "object_cache"/"object--cache_host"/etc., which don't
+  # exist and made every `wp litespeed-option set` call fail with
+  # "Error: ID not exist"). `object-kind` is a truthy/falsy flag in the
+  # plugin's own source (src/object-cache.cls.php): truthy selects Redis,
+  # falsy selects Memcached — set to "1" here since WPM only ever wires up
+  # Redis.
   local -A lscwp_opts=(
-    [object_cache]="1"
-    [object--cache_host]="127.0.0.1"
-    [object--cache_port]="6379"
-    [object--cache_user]="${redis_user}"
-    [object--cache_pswd]="${redis_pass}"
-    [object--cache_db]="${redis_db_id}"
+    [object]="1"
+    [object-kind]="1"
+    [object-host]="127.0.0.1"
+    [object-port]="6379"
+    [object-user]="${redis_user}"
+    [object-pswd]="${redis_pass}"
+    [object-db_id]="${redis_db_id}"
   )
 
   local key ok=0 fail=0
