@@ -455,6 +455,18 @@ redis_sync_lscwp() {
 
   require_cmd wp
 
+  # LSCWP's own `wp litespeed-purge all` (dipanggil di bawah) melakukan
+  # HTTP request KELUAR ke URL publik situs ini sendiri (admin-ajax.php) —
+  # kalau domain ini di belakang reverse proxy/CDN (mis. Cloudflare
+  # proxied), request "hairpin" itu (server -> internet -> balik ke server
+  # yang sama) rawan gagal (Cloudflare 521/522) terutama sesaat setelah
+  # vhost/SSL baru saja dibuat + restart. Pastikan /etc/hosts sudah
+  # mengarahkan domain ini langsung ke loopback dulu supaya request
+  # semacam ini tidak perlu keluar-masuk lewat CDN sama sekali.
+  local domain
+  domain="$(app_get "$app" DOMAIN)"
+  [[ -n "$domain" ]] && ols_hosts_add_loopback "$domain"
+
   # Cek dulu apakah plugin LiteSpeed Cache benar-benar aktif di situs ini
   # SEBELUM mencoba set opsi apa pun. Tanpa cek ini, situs yang sumber
   # staging/clone-nya kebetulan tidak menyertakan/mengaktifkan LSCWP akan

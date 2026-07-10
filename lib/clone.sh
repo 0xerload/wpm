@@ -324,6 +324,7 @@ _app_purge() {
     || log_warn "_app_purge: tidak ada map listener HTTPS untuk dihapus (app=${app})"
   ols_remove_listener_map "$(ols_http_listener_name)" "$app" \
     || log_warn "_app_purge: tidak ada map listener HTTP untuk dihapus (app=${app})"
+  [[ -n "$domain" ]] && ols_hosts_remove_loopback "$domain"
 
   # 2. vhost config directory
   if [[ -n "$app" && -d "${OLS_VHOST_DIR}/${app}" ]]; then

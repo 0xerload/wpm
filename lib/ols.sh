@@ -1001,3 +1001,56 @@ ols_import_vhost() {
 
   return 0
 }
+
+# ols_hosts_add_loopback DOMAIN — idempotently adds a "127.0.0.1 DOMAIN #
+# WPM" line to /etc/hosts, so any process running ON THIS SERVER that
+# requests http(s)://DOMAIN/... resolves straight to the local
+# OpenLiteSpeed listener instead of round-tripping out through a reverse
+# proxy/CDN (e.g. Cloudflare) and back to itself.
+#
+# This matters because some plugin functionality makes exactly that kind
+# of self-referential request — e.g. LiteSpeed Cache's own
+# `wp litespeed-purge all` calls admin_url('admin-ajax.php') via an
+# outbound HTTP request to the site's own public URL (confirmed directly
+# from litespeedtech/lscache_wp's cli/purge.cls.php source). On a
+# CDN-proxied domain, that "hairpin" pattern (origin -> CDN -> back to the
+# same origin) is a well-known source of intermittent failures — Cloudflare
+# returns 521/522 when it can't immediately re-establish the connection
+# back to the origin, especially moments after a vhost/SSL config change
+# and graceful restart. Bypassing the CDN entirely for locally-originated
+# requests avoids that whole failure class. This has zero effect on how
+# anyone else on the internet resolves DOMAIN — /etc/hosts only overrides
+# resolution for this one machine.
+ols_hosts_add_loopback() {
+  local domain="$1"
+  [[ -z "$domain" ]] && return 1
+  [[ -f /etc/hosts ]] || return 1
+
+  grep -qF " ${domain} # WPM" /etc/hosts 2>/dev/null && return 0
+
+  printf '127.0.0.1 %s # WPM\n' "$domain" >> /etc/hosts \
+    || { log_error "ols_hosts_add_loopback: gagal menulis ke /etc/hosts untuk '${domain}'"; return 1; }
+
+  log_action "ols_hosts_add_loopback: entri /etc/hosts ditambahkan untuk ${domain} -> 127.0.0.1"
+  return 0
+}
+
+# ols_hosts_remove_loopback DOMAIN — removes the marked entry added by
+# ols_hosts_add_loopback above. Used by _app_purge (lib/clone.sh) when an
+# app is deleted/rolled back, so /etc/hosts doesn't accumulate stale
+# entries over time.
+ols_hosts_remove_loopback() {
+  local domain="$1"
+  [[ -z "$domain" ]] && return 1
+  [[ -f /etc/hosts ]] || return 0
+
+  grep -qF " ${domain} # WPM" /etc/hosts 2>/dev/null || return 0
+
+  local tmp
+  tmp="$(mktemp)" || { log_error "ols_hosts_remove_loopback: mktemp gagal"; return 1; }
+  grep -vF " ${domain} # WPM" /etc/hosts > "$tmp" && cat "$tmp" > /etc/hosts
+  rm -f "$tmp"
+
+  log_action "ols_hosts_remove_loopback: entri /etc/hosts dihapus untuk ${domain}"
+  return 0
+}
