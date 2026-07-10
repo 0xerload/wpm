@@ -780,19 +780,26 @@ _clone_staging_sql_files() {
 # kosong + return 1 kalau keduanya gagal/kosong.
 _clone_detect_old_domain() {
   local docroot="$1"
-  local url=""
+  local raw url=""
 
-  url="$(_clone_wp_run "$docroot" option get siteurl 2>/dev/null)"
-  if [[ -z "$url" ]]; then
-    url="$(_clone_wp_run "$docroot" option get home 2>/dev/null)"
+  # NOTE: `wp option get siteurl` normally prints ONLY the value, but a WP
+  # bootstrap on a site full of old/poorly-maintained plugins can emit a
+  # PHP deprecation/warning/notice line to STDOUT (not just stderr) before
+  # the real value — if that ever got captured blindly, the resulting
+  # "old domain" string would be garbage that matches nothing in the
+  # database, so the caller's `wp search-replace` would silently replace
+  # ZERO rows and still exit 0 (success), leaving the site pointed at the
+  # real old domain with no error ever surfaced. So: pull out ONLY the
+  # first thing that actually looks like a URL from the raw output,
+  # regardless of what other noise surrounds it, instead of trusting the
+  # whole captured string.
+  raw="$(_clone_wp_run "$docroot" option get siteurl 2>/dev/null)"
+  if [[ ! "$raw" =~ https?://([^/[:space:]\"\']+) ]]; then
+    raw="$(_clone_wp_run "$docroot" option get home 2>/dev/null)"
   fi
-  if [[ -z "$url" ]]; then
-    return 1
+  if [[ "$raw" =~ https?://([^/[:space:]\"\']+) ]]; then
+    url="${BASH_REMATCH[1]}"
   fi
-
-  url="${url#http://}"
-  url="${url#https://}"
-  url="${url%%/*}"
 
   if [[ -z "$url" ]]; then
     return 1
