@@ -330,7 +330,7 @@ setup_mysql_credentials() {
     log_info "Memakai WPM_MYSQL_ROOT_USER/WPM_MYSQL_ROOT_PASS dari environment (non-interaktif)."
     tmp="$(mktemp)"; chmod 600 "$tmp"
     printf '[client]\nuser=%s\npassword=%s\nhost=localhost\n' "$db_user" "$db_pass" >"$tmp"
-    if mysql --defaults-extra-file="$tmp" -e 'SELECT 1;' >/dev/null 2>&1; then
+    if "$(_wpm_mysql_bin)" --defaults-extra-file="$tmp" -e 'SELECT 1;' >/dev/null 2>&1; then
       rm -f "$tmp"
       mkdir -p "$WPM_ETC"; chmod 700 "$WPM_ETC"
       _wpm_conf_write_file "$WPM_SECRETS" 600 MYSQL_ROOT_USER="$db_user" MYSQL_ROOT_PASS="$db_pass"
@@ -355,7 +355,7 @@ setup_mysql_credentials() {
 
     tmp="$(mktemp)"; chmod 600 "$tmp"
     printf '[client]\nuser=%s\npassword=%s\nhost=localhost\n' "$db_user" "$db_pass" >"$tmp"
-    if mysql --defaults-extra-file="$tmp" -e 'SELECT 1;' >/dev/null 2>&1; then
+    if "$(_wpm_mysql_bin)" --defaults-extra-file="$tmp" -e 'SELECT 1;' >/dev/null 2>&1; then
       rm -f "$tmp"
       mkdir -p "$WPM_ETC"; chmod 700 "$WPM_ETC"
       _wpm_conf_write_file "$WPM_SECRETS" 600 MYSQL_ROOT_USER="$db_user" MYSQL_ROOT_PASS="$db_pass"

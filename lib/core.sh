@@ -515,6 +515,24 @@ db_defaults_file() {
   printf '%s\n' "$tmp"
 }
 
+# _wpm_mysql_bin / _wpm_mysqldump_bin — echo the preferred client binary
+# name. Modern MariaDB (10.6+) ships `mariadb`/`mariadb-dump` as the
+# primary binaries and keeps `mysql`/`mysqldump` only as deprecated
+# compatibility symlinks that print a noisy "Deprecated program name..."
+# warning to stderr on every single invocation. Prefer the non-deprecated
+# name when it exists; fall back to the classic name otherwise (still
+# required for plain MySQL servers, which have no `mariadb`/`mariadb-dump`
+# binary at all).
+_wpm_mysql_bin() {
+  command -v mariadb >/dev/null 2>&1 && { printf '%s\n' "mariadb"; return 0; }
+  printf '%s\n' "mysql"
+}
+
+_wpm_mysqldump_bin() {
+  command -v mariadb-dump >/dev/null 2>&1 && { printf '%s\n' "mariadb-dump"; return 0; }
+  printf '%s\n' "mysqldump"
+}
+
 # db_exec SQL — runs one statement via mysql using the defaults-file
 # pattern; cleans up its own temp file. Returns mysql's exit status.
 # SQL is fed via stdin (not -e) so it never appears as a process argv
@@ -524,7 +542,7 @@ db_exec() {
   local sql="$1"
   local defaults rc
   defaults="$(db_defaults_file)"
-  local cmd=(mysql)
+  local cmd=("$(_wpm_mysql_bin)")
   [[ -n "$defaults" ]] && cmd+=(--defaults-extra-file="$defaults")
   printf '%s' "$sql" | "${cmd[@]}"
   rc=$?
@@ -579,7 +597,7 @@ db_drop_user() {
 db_list_databases() {
   local defaults rc out
   defaults="$(db_defaults_file)"
-  local cmd=(mysql)
+  local cmd=("$(_wpm_mysql_bin)")
   [[ -n "$defaults" ]] && cmd+=(--defaults-extra-file="$defaults")
   cmd+=(-N -B -e "SHOW DATABASES;")
   out="$("${cmd[@]}" 2>/dev/null)"
@@ -601,8 +619,8 @@ db_dump_import() {
   local defaults
   defaults="$(db_defaults_file)"
 
-  local dump_cmd=(mysqldump --single-transaction --quick)
-  local imp_cmd=(mysql)
+  local dump_cmd=("$(_wpm_mysqldump_bin)" --single-transaction --quick)
+  local imp_cmd=("$(_wpm_mysql_bin)")
   if [[ -n "$defaults" ]]; then
     dump_cmd+=(--defaults-extra-file="$defaults")
     imp_cmd+=(--defaults-extra-file="$defaults")
@@ -661,7 +679,7 @@ db_import_sql_file() {
   local defaults
   defaults="$(db_defaults_file)"
 
-  local imp_cmd=(mysql)
+  local imp_cmd=("$(_wpm_mysql_bin)")
   [[ -n "$defaults" ]] && imp_cmd+=(--defaults-extra-file="$defaults")
   imp_cmd+=("$dst_db")
 

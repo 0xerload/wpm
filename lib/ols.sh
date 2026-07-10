@@ -125,6 +125,91 @@ _ols_listener_name_for_port() {
   ' "$OLS_CONF"
 }
 
+# _ols_create_listener NAME PORT [KEYFILE CERTFILE] — appends a new,
+# minimal `listener NAME { address *:PORT ... }` block to $OLS_CONF
+# (plain/secure 0 if KEYFILE/CERTFILE are omitted, secure 1 with those cert
+# paths otherwise). Backs up config first (ols_backup_config). Refuses to
+# run if NAME already exists (never overwrites/duplicates) or if $OLS_CONF
+# is missing. Does NOT restart OLS itself — the caller's own pipeline step
+# already does a graceful restart right after mapping the vhost, which
+# picks this up in that same restart.
+#
+# IMPORTANT: this function's only permitted stdout is via log_error (which
+# writes to stderr, not stdout) — it is called from ols_http_listener_name/
+# ols_https_listener_name, which are themselves always invoked via a
+# subshelled `$(...)` at every call site in lib/clone.sh and lib/ssl.sh.
+# Anything this function (or anything it calls) prints to stdout would
+# silently get appended into the "listener name" string those callers
+# capture, corrupting it. Never call log_info/log_warn from here or from
+# anything reachable from here — only log_error (stderr) and log_action
+# (log-file only) are safe.
+_ols_create_listener() {
+  local name="$1" port="$2" keyfile="${3:-}" certfile="${4:-}"
+
+  if [[ -z "$name" || -z "$port" ]]; then
+    log_error "_ols_create_listener: NAME dan PORT wajib diisi"
+    return 1
+  fi
+  if [[ ! -f "$OLS_CONF" ]]; then
+    log_error "_ols_create_listener: $OLS_CONF tidak ditemukan"
+    return 1
+  fi
+  if _ols_listener_block_exists "$name"; then
+    log_error "_ols_create_listener: listener '${name}' sudah ada, tidak membuat duplikat"
+    return 1
+  fi
+
+  ols_backup_config >/dev/null 2>&1
+
+  {
+    printf '\nlistener %s {\n' "$name"
+    printf '  address                 *:%s\n' "$port"
+    if [[ -n "$keyfile" && -n "$certfile" ]]; then
+      printf '  secure                  1\n'
+      printf '  keyFile                 %s\n' "$keyfile"
+      printf '  certFile                %s\n' "$certfile"
+      printf '  certChain               1\n'
+    else
+      printf '  secure                  0\n'
+    fi
+    printf '}\n'
+  } >> "$OLS_CONF"
+
+  log_action "_ols_create_listener: listener '${name}' (*:${port}) ditambahkan ke ${OLS_CONF}"
+  return 0
+}
+
+# _ols_ensure_selfsigned_cert — echoes "KEYFILE CERTFILE" for a WPM-managed
+# self-signed certificate at $WPM_ETC/wpm-selfsigned.{key,crt}, generating
+# one (via openssl) if it doesn't exist yet. This is ONLY a bootstrap
+# fallback so a freshly-created HTTPS listener has something to bind
+# with — it is never used for a real app's actual certificate (those come
+# from Let's Encrypt per-vhost via the vhssl{} block + SNI, same as
+# ssl_install_vhssl already does). Returns 1 (prints nothing) if openssl
+# is unavailable or generation fails.
+_ols_ensure_selfsigned_cert() {
+  local key="${WPM_ETC}/wpm-selfsigned.key" crt="${WPM_ETC}/wpm-selfsigned.crt"
+
+  if [[ -f "$key" && -f "$crt" ]]; then
+    printf '%s %s\n' "$key" "$crt"
+    return 0
+  fi
+
+  command -v openssl >/dev/null 2>&1 || return 1
+  mkdir -p "$WPM_ETC" 2>/dev/null
+
+  if openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+        -keyout "$key" -out "$crt" -subj "/CN=localhost" >/dev/null 2>&1; then
+    chmod 600 "$key" 2>/dev/null
+    chmod 644 "$crt" 2>/dev/null
+    log_action "_ols_ensure_selfsigned_cert: sertifikat self-signed sementara dibuat (${key}, ${crt})"
+    printf '%s %s\n' "$key" "$crt"
+    return 0
+  fi
+
+  return 1
+}
+
 # ols_http_listener_name / ols_https_listener_name — echo the ACTUAL name of
 # whichever listener in $OLS_CONF is bound to port 80 / port 443,
 # regardless of what it's called. Real-world OpenLiteSpeed installs
@@ -133,22 +218,54 @@ _ols_listener_name_for_port() {
 # installers/admins may name it anything) — hardcoding those two literal
 # names here caused ols_write_listener_map to die with "blok listener
 # 'Default' tidak ditemukan" on any server whose port-80 listener has a
-# different name, even though a perfectly usable one exists. Falls back to
-# the literal "Default"/"SSL" only if no listener is bound to that port at
-# all, preserving the original behavior (and its clear error message) for
-# a genuinely-unconfigured base httpd_config.
+# different name, even though a perfectly usable one exists.
+#
+# If NO listener at all is bound to that port (common on a freshly
+# provisioned OpenLiteSpeed — e.g. the stock/ols1clk default listener is
+# often only on :8088/:7080, not :80/:443), WPM cannot map any vhost
+# without one, so a minimal one is created automatically (via
+# _ols_create_listener) rather than requiring a manual one-time
+# httpd_config.conf edit: "Default" (or "WPM_HTTP"/"WPM_HTTPS" if that
+# literal name is already taken by something on a different port) for
+# HTTP, and the same idea for HTTPS using a temporary self-signed
+# certificate (real per-app certs still come from Let's Encrypt via the
+# per-vhost vhssl{} block, same as always — this is only so the base
+# HTTPS listener has something to bind with). If creation itself fails for
+# any reason (e.g. openssl missing, permission issue), the literal
+# fallback name is still returned so ols_write_listener_map's own
+# "listener tidak ditemukan" error (now a graceful return 1, not a die)
+# fires with a clear message instead of silently doing nothing.
 ols_http_listener_name() {
   local n
   n="$(_ols_listener_name_for_port 80)"
-  [[ -n "$n" ]] && { printf '%s\n' "$n"; return 0; }
-  printf '%s\n' "Default"
+  if [[ -n "$n" ]]; then
+    printf '%s\n' "$n"
+    return 0
+  fi
+
+  local target_name="Default"
+  _ols_listener_block_exists "$target_name" && target_name="WPM_HTTP"
+  _ols_create_listener "$target_name" 80 >/dev/null 2>&1
+  printf '%s\n' "$target_name"
 }
 
 ols_https_listener_name() {
   local n
   n="$(_ols_listener_name_for_port 443)"
-  [[ -n "$n" ]] && { printf '%s\n' "$n"; return 0; }
-  printf '%s\n' "SSL"
+  if [[ -n "$n" ]]; then
+    printf '%s\n' "$n"
+    return 0
+  fi
+
+  local target_name="SSL"
+  _ols_listener_block_exists "$target_name" && target_name="WPM_HTTPS"
+
+  local certinfo key crt
+  if certinfo="$(_ols_ensure_selfsigned_cert)"; then
+    read -r key crt <<<"$certinfo"
+    _ols_create_listener "$target_name" 443 "$key" "$crt" >/dev/null 2>&1
+  fi
+  printf '%s\n' "$target_name"
 }
 
 # _ols_patch_vhconf_domain_and_logs VHCONF NEW_DOMAIN
