@@ -771,29 +771,64 @@ _clone_staging_sql_files() {
   printf '%s\n' "${files[@]}" | sort
 }
 
-# _clone_detect_old_domain DOCROOT — echo bare host (tanpa skema, tanpa
-# path, tanpa trailing slash) dari url LAMA situs yang baru saja diimpor,
-# dibaca lewat `wp option get siteurl` (fallback ke `option get home` kalau
-# kosong). Dipakai clone_execute_one_from_staging's [5/8] karena sumber
+# _clone_db_get_option DB_NAME OPTION_NAME — echoes OPTION_NAME's value
+# directly from DB_NAME.wp_options via a raw SQL query (mysql/mariadb
+# client, -N -B for clean unadorned output — same db_defaults_file/
+# _wpm_mysql_bin pattern as db_list_databases in lib/core.sh), completely
+# bypassing WordPress/PHP/wp-cli. Deliberately NOT done via `wp option
+# get`, which fully bootstraps WordPress — loading every plugin — before
+# it ever prints anything: on a site with old/misbehaving plugins, that
+# bootstrap can emit a PHP deprecation/warning/notice line to STDOUT ahead
+# of the real value, silently corrupting whatever's captured. OPTION_NAME
+# is always one of our own fixed literal strings ("siteurl"/"home"),
+# never external input, so it's safe to embed directly in the SQL.
+# Assumes the standard `wp_options` table name — a non-default
+# $table_prefix isn't supported by this helper (falls through to the
+# wp-cli fallback in _clone_detect_old_domain below instead).
+_clone_db_get_option() {
+  local db_name="$1" option_name="$2"
+  is_valid_db_name "$db_name" || return 1
+
+  local defaults out rc
+  defaults="$(db_defaults_file)"
+  local cmd=("$(_wpm_mysql_bin)")
+  [[ -n "$defaults" ]] && cmd+=(--defaults-extra-file="$defaults")
+  cmd+=(-N -B "$db_name")
+
+  out="$(printf '%s' "SELECT option_value FROM wp_options WHERE option_name='${option_name}' LIMIT 1;" | "${cmd[@]}" 2>/dev/null)"
+  rc=$?
+  [[ -n "$defaults" ]] && rm -f "$defaults"
+  (( rc != 0 )) && return 1
+
+  printf '%s\n' "$out"
+}
+
+# _clone_detect_old_domain DOCROOT [DB_NAME] — echo bare host (tanpa skema,
+# tanpa path, tanpa trailing slash) dari url LAMA situs yang baru saja
+# diimpor. Dipakai clone_execute_one_from_staging's [5/8] karena sumber
 # staging tidak punya registry DOMAIN untuk dibaca (berbeda dari clone
 # app-ke-app, yang membaca DOMAIN app sumber langsung dari registry). Echo
-# kosong + return 1 kalau keduanya gagal/kosong.
+# kosong + return 1 kalau semua cara gagal/kosong.
 _clone_detect_old_domain() {
-  local docroot="$1"
+  local docroot="$1" db_name="${2:-}"
   local raw url=""
 
-  # NOTE: `wp option get siteurl` normally prints ONLY the value, but a WP
-  # bootstrap on a site full of old/poorly-maintained plugins can emit a
-  # PHP deprecation/warning/notice line to STDOUT (not just stderr) before
-  # the real value — if that ever got captured blindly, the resulting
-  # "old domain" string would be garbage that matches nothing in the
-  # database, so the caller's `wp search-replace` would silently replace
-  # ZERO rows and still exit 0 (success), leaving the site pointed at the
-  # real old domain with no error ever surfaced. So: pull out ONLY the
-  # first thing that actually looks like a URL from the raw output,
-  # regardless of what other noise surrounds it, instead of trusting the
-  # whole captured string.
-  raw="$(_clone_wp_run "$docroot" option get siteurl 2>/dev/null)"
+  # Cara utama: query wp_options langsung lewat mysql/mariadb client
+  # (_clone_db_get_option), tanpa bootstrap WordPress sama sekali — jadi
+  # tidak mungkin tercemar output PHP warning/notice dari plugin apa pun.
+  if [[ -n "$db_name" ]]; then
+    raw="$(_clone_db_get_option "$db_name" siteurl)"
+    if [[ ! "$raw" =~ https?://([^/[:space:]\"\']+) ]]; then
+      raw="$(_clone_db_get_option "$db_name" home)"
+    fi
+  fi
+
+  # Fallback: wp-cli (hanya kalau query langsung di atas tidak berhasil —
+  # mis. $table_prefix bukan "wp_" default). Tetap pakai ekstraksi regex
+  # di bawah sebagai lapisan pengaman kedua terhadap kontaminasi output.
+  if [[ ! "$raw" =~ https?://([^/[:space:]\"\']+) ]]; then
+    raw="$(_clone_wp_run "$docroot" option get siteurl 2>/dev/null)"
+  fi
   if [[ ! "$raw" =~ https?://([^/[:space:]\"\']+) ]]; then
     raw="$(_clone_wp_run "$docroot" option get home 2>/dev/null)"
   fi
@@ -1055,7 +1090,7 @@ clone_execute_one_from_staging() {
   # --- [5/8] deteksi domain lama dari data staging + search-replace ------
   log_info "[5/8] Mendeteksi domain lama dari data staging & wp search-replace..."
   local old_domain
-  old_domain="$(_clone_detect_old_domain "$new_docroot")"
+  old_domain="$(_clone_detect_old_domain "$new_docroot" "$new_db")"
   if [[ -z "$old_domain" ]]; then
     _clone_step_failed "$new_app" "[5/8] search-replace" "domain lama tidak terdeteksi dari data staging (periksa wp_options/siteurl di dump SQL)"
     return 1
