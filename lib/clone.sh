@@ -551,6 +551,9 @@ clone_execute_one() {
         --exclude '*/wp-content/litespeed/' \
         --exclude '**/wp-content/cache/' \
         --exclude '**/wp-content/litespeed/' \
+        --exclude 'wp-content/object-cache.php' \
+        --exclude '*/wp-content/object-cache.php' \
+        --exclude '**/wp-content/object-cache.php' \
         -- "${src_vh_root%/}/" "${new_vh_root%/}/" >>"$WPM_LOG_FILE" 2>&1; then
     _clone_step_failed "$new_app" "[1/8] rsync" "gagal menyalin file dari '${src_vh_root}'"
     return 1
@@ -594,6 +597,13 @@ clone_execute_one() {
     return 1
   fi
   log_action "clone_execute_one[${new_app}]: [4/8] wp-config.php dipatch"
+
+  # Defensive: kalau app sumber punya drop-in object-cache.php (LiteSpeed
+  # Cache atau plugin cache lain) yang somehow ikut tersalin meski sudah
+  # di-exclude di [1/8], pastikan tidak ada nilai yang di-cache dari
+  # sebelum clone yang ikut terbawa — non-fatal, murni pencegahan.
+  _clone_wp_run "$new_docroot" cache flush >>"$WPM_LOG_FILE" 2>&1 \
+    || log_warn "clone_execute_one[${new_app}]: 'wp cache flush' gagal (non-fatal)"
 
   # --- [5/8] wp search-replace domain lama -> domain baru ----------------
   log_info "[5/8] wp search-replace domain lama -> domain baru (aman untuk data serialized)..."
@@ -966,6 +976,9 @@ clone_execute_one_from_staging() {
         --exclude '*/wp-content/litespeed/' \
         --exclude '**/wp-content/cache/' \
         --exclude '**/wp-content/litespeed/' \
+        --exclude 'wp-content/object-cache.php' \
+        --exclude '*/wp-content/object-cache.php' \
+        --exclude '**/wp-content/object-cache.php' \
         -- "${WPM_STAGE_DIR}/${stage_name}/data/" "${new_docroot}/" >>"$WPM_LOG_FILE" 2>&1; then
     _clone_step_failed "$new_app" "[1/8] rsync" "gagal menyalin file dari '${WPM_STAGE_DIR}/${stage_name}/data'"
     return 1
@@ -1015,6 +1028,22 @@ clone_execute_one_from_staging() {
     return 1
   fi
   log_action "clone_execute_one_from_staging[${new_app}]: [4/8] wp-config.php dipatch"
+
+  # Defensif — dan PENTING di jalur staging ini secara khusus: sumber
+  # staging sering kali sudah punya plugin cache (mis. LiteSpeed Cache)
+  # aktif lengkap dengan drop-in object-cache.php. Meski drop-in itu sudah
+  # di-exclude di [1/8] supaya tidak ikut tersalin (drop-in itu berisi
+  # konfigurasi cache milik environment SUMBER, bukan app baru ini), flush
+  # di sini tetap dilakukan sebagai lapisan pencegahan kedua — kalau
+  # sampai ada nilai ter-cache dari sebelum clone (mis. karena drop-in lain
+  # yang tidak ter-exclude), deteksi domain lama di [5/8] di bawah ini bisa
+  # salah baca nilai siteurl/home yang stale sehingga wp search-replace
+  # mencari string yang salah dan tidak mengganti apa pun (search-replace
+  # tetap exit 0 walau 0 baris diganti, jadi kegagalan seperti ini tidak
+  # akan pernah muncul sebagai [ERROR] — situs baru hanya akan diam-diam
+  # tetap redirect/menunjuk ke domain lama).
+  _clone_wp_run "$new_docroot" cache flush >>"$WPM_LOG_FILE" 2>&1 \
+    || log_warn "clone_execute_one_from_staging[${new_app}]: 'wp cache flush' gagal (non-fatal)"
 
   # --- [5/8] deteksi domain lama dari data staging + search-replace ------
   log_info "[5/8] Mendeteksi domain lama dari data staging & wp search-replace..."
