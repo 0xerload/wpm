@@ -455,6 +455,20 @@ redis_sync_lscwp() {
 
   require_cmd wp
 
+  # Cek dulu apakah plugin LiteSpeed Cache benar-benar aktif di situs ini
+  # SEBELUM mencoba set opsi apa pun. Tanpa cek ini, situs yang sumber
+  # staging/clone-nya kebetulan tidak menyertakan/mengaktifkan LSCWP akan
+  # gagal di SEMUA 6 opsi + purge dengan pesan yang membingungkan (satu
+  # per satu, tanpa penjelasan akar masalah) — padahal akar masalahnya
+  # cuma satu: perintah `wp litespeed-option`/`wp litespeed-purge` memang
+  # disediakan OLEH plugin itu sendiri, jadi tidak ada sama sekali kalau
+  # plugin-nya tidak aktif. Satu pesan jelas di sini lebih berguna daripada
+  # tujuh pesan generik.
+  if ! _redis_wp_run "$docroot" plugin is-active litespeed-cache >/dev/null 2>>"$WPM_LOG_FILE"; then
+    log_warn "redis_sync_lscwp: plugin LiteSpeed Cache tidak terpasang/tidak aktif di app '${app}' — sinkronisasi kredensial Redis ke LSCWP dilewati (situs tetap berjalan, hanya tanpa object cache Redis). Pasang & aktifkan plugin 'litespeed-cache' di app ini (atau di sumber staging-nya untuk clone berikutnya) lalu jalankan ulang dari menu Redis ACL bila diinginkan."
+    return 1
+  fi
+
   # LSCWP object-cache option keys — single array, easy to retune per
   # plugin version without touching the sync logic below.
   local -A lscwp_opts=(
@@ -468,16 +482,16 @@ redis_sync_lscwp() {
 
   local key ok=0 fail=0
   for key in "${!lscwp_opts[@]}"; do
-    if _redis_wp_run "$docroot" litespeed-option update "$key" "${lscwp_opts[$key]}" >/dev/null 2>&1; then
+    if _redis_wp_run "$docroot" litespeed-option set "$key" "${lscwp_opts[$key]}" >/dev/null 2>>"$WPM_LOG_FILE"; then
       ok=$((ok + 1))
     else
       fail=$((fail + 1))
-      log_warn "redis_sync_lscwp: gagal set opsi LSCWP '${key}' untuk app '${app}'"
+      log_warn "redis_sync_lscwp: gagal set opsi LSCWP '${key}' untuk app '${app}' (detail: ${WPM_LOG_FILE})"
     fi
   done
 
-  if ! _redis_wp_run "$docroot" litespeed-purge all >/dev/null 2>&1; then
-    log_warn "redis_sync_lscwp: 'wp litespeed-purge all' gagal untuk app '${app}'"
+  if ! _redis_wp_run "$docroot" litespeed-purge all >/dev/null 2>>"$WPM_LOG_FILE"; then
+    log_warn "redis_sync_lscwp: 'wp litespeed-purge all' gagal untuk app '${app}' (detail: ${WPM_LOG_FILE})"
   fi
 
   if [[ "$fail" -gt 0 ]]; then

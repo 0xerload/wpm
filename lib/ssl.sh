@@ -207,14 +207,59 @@ ssl_get_public_ip() {
   printf '%s\n' "$ip"
 }
 
-# ssl_check_dns DOMAIN — resolves DOMAIN's A record(s) and compares them
-# against ssl_get_public_ip. Returns 0 if any A record matches this VPS's
-# public IP, 1 otherwise (including "couldn't determine" cases — this
-# fails closed on purpose: never call certbot on an inconclusive check).
-# This is the mandatory gate every other function in this file runs BEFORE
+# _ssl_http_reachable DOMAIN DOCROOT — fallback used by ssl_check_dns when
+# the direct A-record comparison doesn't match: writes a random marker
+# file under DOCROOT/.well-known/acme-challenge/ and tries to fetch it
+# back over plain HTTP via the public domain name (following redirects,
+# since a same-host HTTP->HTTPS redirect is normal and is itself followed
+# by Let's Encrypt's own HTTP-01 validator). This is exactly the mechanism
+# certbot's webroot HTTP-01 challenge relies on — if THIS succeeds,
+# certbot's real challenge almost certainly will too, regardless of why
+# the A-record comparison didn't match.
+#
+# This specifically covers domains behind a reverse proxy/CDN — e.g.
+# Cloudflare with the orange-cloud "proxied" mode on — where the public A
+# record legitimately points at the proxy's edge IP rather than this VPS
+# (by design), yet HTTP traffic (including the ACME challenge) is still
+# correctly forwarded here. It is a strictly MORE accurate signal than
+# comparing IPs: it directly tests the one thing that actually matters
+# (does this domain's HTTP traffic reach this exact docroot), rather than
+# a proxy for it. Cleans up the marker file regardless of outcome.
+_ssl_http_reachable() {
+  local domain="$1" docroot="$2"
+  [[ -z "$domain" || -z "$docroot" || ! -d "$docroot" ]] && return 1
+  command -v curl >/dev/null 2>&1 || return 1
+
+  local dir="${docroot}/.well-known/acme-challenge"
+  mkdir -p "$dir" 2>/dev/null || return 1
+
+  local token body file fetched
+  token="wpm-dns-check-$(rand_password 16)"
+  body="wpm-dns-check-$(rand_password 16)"
+  file="${dir}/${token}"
+
+  printf '%s' "$body" > "$file" 2>/dev/null || return 1
+
+  fetched="$(curl -fsSL --max-time 15 -H 'Cache-Control: no-cache' \
+    "http://${domain}/.well-known/acme-challenge/${token}" 2>/dev/null)"
+
+  rm -f "$file" 2>/dev/null
+
+  [[ "$fetched" == "$body" ]]
+}
+
+# ssl_check_dns DOMAIN [DOCROOT] — resolves DOMAIN's A record(s) and
+# compares them against ssl_get_public_ip. Returns 0 if any A record
+# matches this VPS's public IP, OR (when DOCROOT is given) if the
+# reverse-proxy/CDN-aware _ssl_http_reachable fallback above succeeds;
+# returns 1 otherwise (including "couldn't determine" cases — this fails
+# closed on purpose: never call certbot on an inconclusive check). DOCROOT
+# is optional for backward compatibility, but every caller in this
+# codebase passes it so the CDN-aware fallback is always available. This
+# is the mandatory gate every other function in this file runs BEFORE
 # ever invoking certbot (§7.2/§9).
 ssl_check_dns() {
-  local domain="$1"
+  local domain="$1" docroot="${2:-}"
 
   if [[ -z "$domain" ]]; then
     log_error "ssl_check_dns: domain wajib diisi"
@@ -246,6 +291,11 @@ ssl_check_dns() {
 
   if [[ "$matched" -eq 0 ]]; then
     log_action "ssl_check_dns: domain '${domain}' menunjuk ke IP VPS ini (${public_ip})"
+    return 0
+  fi
+
+  if [[ -n "$docroot" ]] && _ssl_http_reachable "$domain" "$docroot"; then
+    log_action "ssl_check_dns: domain '${domain}' tidak match IP VPS secara langsung (IP VPS=${public_ip}; A record: $(printf '%s' "$records" | tr '\n' ' ')) — kemungkinan di belakang proxy/CDN (mis. Cloudflare proxied), tapi lolos tes jangkauan HTTP .well-known/acme-challenge — dianggap pointing dengan benar"
     return 0
   fi
 
@@ -432,7 +482,7 @@ ssl_retry() {
   log_info "Retry SSL untuk '${app}' (domain: ${domain}, status saat ini: ${cur_status:-none})..."
   log_action "ssl_retry: mulai app=${app} domain=${domain} status_lama=${cur_status:-none}"
 
-  if ! ssl_check_dns "$domain"; then
+  if ! ssl_check_dns "$domain" "$docroot"; then
     log_warn "Retry SSL '${app}': domain '${domain}' belum menunjuk ke IP VPS ini — certbot TIDAK dipanggil (hemat kuota rate limit Let's Encrypt, §7.2/§9). Status SSL tidak diubah, coba lagi setelah DNS pointing dengan benar."
     log_action "ssl_retry: dibatalkan app=${app} alasan=dns_belum_pointing status_tidak_diubah=${cur_status:-none}"
     return 1
@@ -496,7 +546,7 @@ ssl_run_for_new_app() {
   log_info "Menyiapkan SSL untuk '${app}' (domain: ${domain})..."
   log_action "ssl_run_for_new_app: mulai app=${app} domain=${domain}"
 
-  if ! ssl_check_dns "$domain"; then
+  if ! ssl_check_dns "$domain" "$docroot"; then
     log_warn "SSL '${app}': domain '${domain}' belum menunjuk ke IP VPS ini. App tetap live di HTTP; ulangi lewat menu Retry SSL (§F-3d) setelah DNS pointing."
     log_action "ssl_run_for_new_app: dilewati app=${app} alasan=dns_belum_pointing status=none"
     if app_exists "$app"; then
