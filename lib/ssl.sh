@@ -375,8 +375,8 @@ ssl_install_vhssl() {
   rm -f "$block_file"
   log_action "ssl_install_vhssl: blok vhssl dipasang di vhconf app '${app}' (domain=${domain})"
 
-  if ! ols_write_listener_map "SSL" "$app" "$domain"; then
-    log_error "ssl_install_vhssl: gagal memetakan listener SSL (:443) untuk app '${app}'"
+  if ! ols_write_listener_map "$(ols_https_listener_name)" "$app" "$domain"; then
+    log_error "ssl_install_vhssl: gagal memetakan listener HTTPS (:443) untuk app '${app}'"
     return 1
   fi
 

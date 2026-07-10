@@ -101,6 +101,56 @@ _ols_listener_block_exists() {
   ' "$OLS_CONF"
 }
 
+# _ols_listener_name_for_port PORT — echoes the name of the first top-level
+# `listener NAME { ... address ...:PORT ... }` block in $OLS_CONF whose
+# `address` directive is bound to PORT (matches "*:PORT", "0.0.0.0:PORT",
+# "<ip>:PORT" — anything ending in ":PORT"). Echoes nothing (and the caller
+# sees an empty string) if none found.
+_ols_listener_name_for_port() {
+  local port="$1"
+  [[ -f "$OLS_CONF" ]] || return 1
+  awk -v port="$port" '
+    function trim(s) { gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s); return s }
+    BEGIN { in_l = 0; lname = "" }
+    {
+      t = trim($0)
+      n = split(t, w, /[ \t]+/)
+      if (!in_l) {
+        if (n >= 3 && w[1] == "listener" && w[n] == "{") { in_l = 1; lname = w[2] }
+        next
+      }
+      if (t == "}") { in_l = 0; next }
+      if (n >= 2 && w[1] == "address" && w[2] ~ (":" port "$")) { print lname; exit }
+    }
+  ' "$OLS_CONF"
+}
+
+# ols_http_listener_name / ols_https_listener_name — echo the ACTUAL name of
+# whichever listener in $OLS_CONF is bound to port 80 / port 443,
+# regardless of what it's called. Real-world OpenLiteSpeed installs
+# commonly ship a listener that is NOT literally named "Default"/"SSL"
+# (the stock config's listener is named "Example", and one-click
+# installers/admins may name it anything) — hardcoding those two literal
+# names here caused ols_write_listener_map to die with "blok listener
+# 'Default' tidak ditemukan" on any server whose port-80 listener has a
+# different name, even though a perfectly usable one exists. Falls back to
+# the literal "Default"/"SSL" only if no listener is bound to that port at
+# all, preserving the original behavior (and its clear error message) for
+# a genuinely-unconfigured base httpd_config.
+ols_http_listener_name() {
+  local n
+  n="$(_ols_listener_name_for_port 80)"
+  [[ -n "$n" ]] && { printf '%s\n' "$n"; return 0; }
+  printf '%s\n' "Default"
+}
+
+ols_https_listener_name() {
+  local n
+  n="$(_ols_listener_name_for_port 443)"
+  [[ -n "$n" ]] && { printf '%s\n' "$n"; return 0; }
+  printf '%s\n' "SSL"
+}
+
 # _ols_patch_vhconf_domain_and_logs VHCONF NEW_DOMAIN
 # In-place patch of a copied vhconf.conf: rewrites vhDomain/vhAliases
 # values to NEW_DOMAIN, and rewrites accesslog/errorlog header paths to
@@ -386,7 +436,17 @@ ols_remove_vhost_block() {
 
 # ols_write_listener_map LISTENER_NAME APP DOMAIN
 # Appends/replaces "  map   <APP> <DOMAIN>" inside the named listener{}
-# block. Idempotent per APP. Dies if the listener block doesn't exist.
+# block. Idempotent per APP. Returns 1 (does NOT die/exit) if the listener
+# block doesn't exist — this function is called directly (not via a
+# subshelled `$(...)`) from clone_execute_one/clone_execute_one_from_staging,
+# so a die() here would `exit` the whole interactive wpm process instead of
+# just failing this one step, skipping the caller's own
+# _clone_step_failed/rollback handling entirely and leaving a half-created
+# app (files + database already made) stuck in the registry with no way to
+# clean itself up. Missing args / missing OLS_CONF still die() since those
+# indicate a programming error in the caller, not a normal first-run
+# server-config condition (unlike a missing listener block, which real
+# servers commonly hit — see ols_http_listener_name/ols_https_listener_name).
 ols_write_listener_map() {
   local lname="$1" app="$2" domain="$3"
   _ols_require_valid_app "$app"
@@ -398,7 +458,8 @@ ols_write_listener_map() {
     die "ols_write_listener_map: $OLS_CONF tidak ditemukan"
   fi
   if ! _ols_listener_block_exists "$lname"; then
-    die "ols_write_listener_map: blok listener '${lname}' tidak ditemukan di $OLS_CONF. Periksa §7.2 — listener Default (:80) dan SSL (:443) harus sudah ada pada httpd_config dasar sebelum WPM dapat memetakan vhost."
+    log_error "ols_write_listener_map: blok listener '${lname}' tidak ditemukan di $OLS_CONF. Periksa §7.2 — listener untuk port :80 (HTTP) dan :443 (HTTPS) harus sudah ada pada httpd_config dasar sebelum WPM dapat memetakan vhost."
+    return 1
   fi
 
   ols_backup_config

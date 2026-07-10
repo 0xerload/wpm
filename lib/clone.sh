@@ -320,10 +320,10 @@ _app_purge() {
   #    a half-finished clone may only have one of these, or neither).
   ols_remove_vhost_block "$app" \
     || log_warn "_app_purge: tidak ada blok virtualhost untuk dihapus (app=${app})"
-  ols_remove_listener_map "SSL" "$app" \
-    || log_warn "_app_purge: tidak ada map listener SSL untuk dihapus (app=${app})"
-  ols_remove_listener_map "Default" "$app" \
-    || log_warn "_app_purge: tidak ada map listener Default untuk dihapus (app=${app})"
+  ols_remove_listener_map "$(ols_https_listener_name)" "$app" \
+    || log_warn "_app_purge: tidak ada map listener HTTPS untuk dihapus (app=${app})"
+  ols_remove_listener_map "$(ols_http_listener_name)" "$app" \
+    || log_warn "_app_purge: tidak ada map listener HTTP untuk dihapus (app=${app})"
 
   # 2. vhost config directory
   if [[ -n "$app" && -d "${OLS_VHOST_DIR}/${app}" ]]; then
@@ -624,13 +624,14 @@ clone_execute_one() {
     _clone_step_failed "$new_app" "[6/8] vhconf" "gagal menulis blok virtualhost"
     return 1
   fi
-  # NOTE: ols_write_listener_map dies (per lib/ols.sh's own contract) if the
-  # "Default" listener block is missing from httpd_config.conf — that is a
-  # systemic base-config problem (affects every future app, not just this
-  # one), so it is intentionally allowed to hard-stop the whole process
-  # here rather than being caught as a per-app recoverable failure.
-  if ! ols_write_listener_map "Default" "$new_app" "$new_domain"; then
-    _clone_step_failed "$new_app" "[6/8] vhconf" "gagal memetakan listener Default (:80)"
+  # NOTE: ols_write_listener_map returns 1 (does not die/exit) if no
+  # listener is bound to port :80 under any name — ols_http_listener_name
+  # auto-detects whichever listener is actually bound there (real
+  # OpenLiteSpeed installs commonly name it something other than
+  # "Default", e.g. the stock "Example" listener), falling back to the
+  # literal "Default" only if nothing is bound to :80 at all.
+  if ! ols_write_listener_map "$(ols_http_listener_name)" "$new_app" "$new_domain"; then
+    _clone_step_failed "$new_app" "[6/8] vhconf" "gagal memetakan listener HTTP (:80)"
     return 1
   fi
   ols_snapshot_vhconf "$new_app" \
@@ -1040,13 +1041,14 @@ clone_execute_one_from_staging() {
     _clone_step_failed "$new_app" "[6/8] vhconf" "gagal menulis blok virtualhost"
     return 1
   fi
-  # NOTE: sama seperti clone_execute_one, ols_write_listener_map dies kalau
-  # blok listener "Default" tidak ada di httpd_config.conf — itu masalah
-  # sistemik pada base config (pengaruh ke semua app di masa depan, bukan
-  # cuma app ini), sengaja dibiarkan hard-stop di sini alih-alih ditangkap
-  # sebagai kegagalan per-app.
-  if ! ols_write_listener_map "Default" "$new_app" "$new_domain"; then
-    _clone_step_failed "$new_app" "[6/8] vhconf" "gagal memetakan listener Default (:80)"
+  # NOTE: sama seperti clone_execute_one, ols_write_listener_map mengembalikan
+  # 1 (bukan die/exit) bila tidak ada listener di port :80 dengan nama apa
+  # pun — ols_http_listener_name mendeteksi otomatis listener yang benar-benar
+  # terpasang di port itu (banyak instalasi OpenLiteSpeed nyata tidak
+  # menamakannya "Default", mis. listener bawaan "Example"), baru jatuh ke
+  # literal "Default" bila memang tidak ada apa pun di port :80.
+  if ! ols_write_listener_map "$(ols_http_listener_name)" "$new_app" "$new_domain"; then
+    _clone_step_failed "$new_app" "[6/8] vhconf" "gagal memetakan listener HTTP (:80)"
     return 1
   fi
   if ! ols_graceful_restart; then

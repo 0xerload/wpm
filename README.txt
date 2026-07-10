@@ -133,7 +133,44 @@ Setelah selesai, jalankan tool dengan:
 
 
 --------------------------------------------------------------------------------
-3. PEMAKAIAN — MENU UTAMA
+3. UPDATE
+--------------------------------------------------------------------------------
+
+Sudah pernah pasang WPM dan ingin memperbarui ke versi source terbaru (mis.
+setelah menarik perbaikan bug)? Pakai update.sh, BUKAN install.sh —
+install.sh untuk pemasangan pertama kali, update.sh untuk memperbarui yang
+sudah ada:
+
+    cd wpm
+    git pull            # atau: salin ulang berkas terbaru ke direktori ini
+    sudo ./update.sh
+
+atau langsung lewat curl tanpa checkout lokal (sama seperti install.sh,
+butuh WPM_REPO_SLUG/WPM_REPO_REF/WPM_TARBALL_URL — lihat bagian 2):
+
+    bash <(curl -sL https://raw.githubusercontent.com/<user>/<repo>/main/update.sh)
+
+update.sh HANYA menyinkronkan ulang berkas kode (lib/, templates/,
+monitor.sh, bot.sh, wpm) ke lokasi terpasang — registry app, database,
+kredensial (/etc/wpm/.secrets, telegram.conf), cron, dan unit systemd TIDAK
+disentuh. Setiap update aman diulang:
+
+  1. Bila dijalankan dari dalam checkout git, otomatis git pull dulu
+     (kecuali WPM_SKIP_GIT_PULL=1).
+  2. Seluruh berkas sumber di-cek sintaksnya (bash -n) SEBELUM disalin —
+     kalau ada yang gagal, instalasi lama tidak diubah sama sekali.
+  3. Instalasi lama di-backup ke .tar.gz di /var/backups/wpm/ sebelum
+     ditimpa.
+  4. Bot Telegram (wpm-bot.service), kalau sedang aktif, ditawarkan untuk
+     di-restart supaya memakai kode terbaru.
+
+Variabel environment opsional: WPM_SKIP_GIT_PULL=1 (pakai isi checkout
+lokal apa adanya, jangan git pull), WPM_ASSUME_YES=1 (lewati konfirmasi,
+untuk otomatisasi).
+
+
+--------------------------------------------------------------------------------
+4. PEMAKAIAN — MENU UTAMA
 --------------------------------------------------------------------------------
 
 Jalankan `wpm` sebagai root. Anda akan melihat menu:
@@ -301,7 +338,7 @@ Pilih app, lalu:
 
 
 --------------------------------------------------------------------------------
-4. MONITORING & TELEGRAM BOT
+5. MONITORING & TELEGRAM BOT
 --------------------------------------------------------------------------------
 
 Ada dua komponen terpisah, bisa dinyalakan/dimatikan sendiri-sendiri:
@@ -336,7 +373,7 @@ Ada dua komponen terpisah, bisa dinyalakan/dimatikan sendiri-sendiri:
 
 
 --------------------------------------------------------------------------------
-5. LOKASI FILE PENTING
+6. LOKASI FILE PENTING
 --------------------------------------------------------------------------------
 
   /usr/local/bin/wpm                     Perintah utama
@@ -355,7 +392,7 @@ Ada dua komponen terpisah, bisa dinyalakan/dimatikan sendiri-sendiri:
 
 
 --------------------------------------------------------------------------------
-6. YANG PERLU DIKETAHUI SEBELUM DIPAKAI DI SERVER PRODUKSI
+7. YANG PERLU DIKETAHUI SEBELUM DIPAKAI DI SERVER PRODUKSI
 --------------------------------------------------------------------------------
 
   - WPM hanya mendukung OpenLiteSpeed instalasi manual di /usr/local/lsws —
@@ -376,12 +413,13 @@ Ada dua komponen terpisah, bisa dinyalakan/dimatikan sendiri-sendiri:
 
 
 --------------------------------------------------------------------------------
-7. STRUKTUR REPOSITORI
+8. STRUKTUR REPOSITORI
 --------------------------------------------------------------------------------
 
   wpm/
   |-- install-prereqs.sh  One-click installer prasyarat (OLS, DB, lsphp, Redis)
   |-- install.sh          One-click installer WPM itu sendiri
+  |-- update.sh           One-click updater untuk instalasi WPM yang sudah ada
   |-- wpm                 Entry point + menu utama
   |-- monitor.sh          Checker alert (dijalankan cron)
   |-- bot.sh              Listener Telegram (daemon opsional)
