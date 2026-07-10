@@ -1,0 +1,1269 @@
+#!/usr/bin/env bash
+#
+# wpm — WPM (WordPress Manager untuk OpenLiteSpeed) — entry point utama.
+#
+# Menu terminal berwarna (NFR-05) yang mengorkestrasi seluruh lib/*.sh sesuai
+# peta menu §4.1 PRD-WPM.md:
+#
+#   1) List Web Apps
+#   2) Clone Web App
+#   3) Kelola Web App        (PHP Settings, Redis ACL, Lihat Access Log,
+#                              Retry SSL, Delete Web App)
+#   4) Tools                 (Fix Ownership, Rebuild Web App Config,
+#                              Clear Web App Cache)
+#   5) Web Server Settings (OpenLiteSpeed)
+#   6) Telegram & Monitoring  (setup wizard, threshold, toggle monitor/bot,
+#                              tes notifikasi)
+#   0) Keluar
+#
+# Konvensi (per WPM-CONTRACT.md):
+#   - require_root dipanggil sekali di awal (setiap entry point WPM wajib
+#     root, §7.3).
+#   - acquire_lock (flock global, non-blocking) dipanggil sebelum jalur menu
+#     mana pun yang MENGUBAH state (config OLS, registry, DB, Redis,
+#     telegram.conf, cron, systemd). Listing murni (F-1) tidak mengunci.
+#   - Semua operasi destruktif melewati confirm/confirm_typed (core.sh) —
+#     wpm sendiri tidak pernah mengasumsikan non-interaktif.
+#   - Tidak ada password yang diteruskan sebagai argumen CLI ke proses lain
+#     bila bisa dihindari (lihat _wpm_webadmin_reset_password).
+#
+# Executable entry point → set -uo pipefail (BUKAN set -e): banyak jalur di
+# sini sengaja menangani kegagalan lib function dengan lanjut ke menu
+# berikutnya alih-alih mati begitu saja.
+
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Sourcing lib/*.sh — mendukung dijalankan langsung dari checkout repo
+# maupun dari lokasi terpasang ($WPM_HOME, default /usr/local/share/wpm).
+# ---------------------------------------------------------------------------
+
+_WPM_BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+if [[ -f "${_WPM_BIN_DIR}/lib/core.sh" ]]; then
+  _WPM_LIB_DIR="${_WPM_BIN_DIR}/lib"
+else
+  _WPM_LIB_DIR="${WPM_HOME:-/usr/local/share/wpm}/lib"
+fi
+unset _WPM_BIN_DIR
+
+for _wpm_lib_name in core ols redis ssl php tools clone telegram; do
+  _wpm_lib_file="${_WPM_LIB_DIR}/${_wpm_lib_name}.sh"
+  if [[ ! -f "$_wpm_lib_file" ]]; then
+    echo "wpm: file library tidak ditemukan: ${_wpm_lib_file}" >&2
+    echo "wpm: pastikan WPM terpasang dengan benar (jalankan ulang install.sh)." >&2
+    exit 1
+  fi
+  # shellcheck source=/dev/null
+  source "$_wpm_lib_file"
+done
+unset _wpm_lib_name _wpm_lib_file _WPM_LIB_DIR
+
+# ---------------------------------------------------------------------------
+# Konstanta khusus wpm (bukan bagian dari lib/core.sh — dipakai lokal saja
+# oleh submenu Telegram & Monitoring / Web Server Settings di file ini).
+# ---------------------------------------------------------------------------
+
+readonly _WPM_CRON_FILE="/etc/cron.d/wpm-monitor"
+readonly _WPM_BOT_SERVICE="wpm-bot.service"
+readonly _WPM_WEBADMIN_CONF="${OLS_HOME}/admin/conf/admin_config.conf"
+readonly _WPM_WEBADMIN_HTPASSWD_FILE="${OLS_HOME}/admin/conf/htpasswd"
+readonly _WPM_WEBADMIN_HTPASSWD_BIN="${OLS_HOME}/admin/misc/htpasswd"
+
+# ============================================================================
+# Helper UI generik
+# ============================================================================
+
+# _wpm_banner — header menu utama (NFR-05: menu angka + warna ANSI).
+_wpm_banner() {
+  printf '\n%s%s╔══════════════════════════════════╗%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  printf '%s%s║   WPM — WordPress Manager (OLS)   ║%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  printf '%s%s╚══════════════════════════════════╝%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  printf '%sversi %s · %s%s\n' "$C_DIM" "$WPM_VERSION" "$(hostname 2>/dev/null || echo '-')" "$C_RESET"
+}
+
+# _wpm_section HEADER — cetak header sub-bagian yang konsisten.
+_wpm_section() {
+  printf '\n%s=== %s ===%s\n' "$C_BOLD" "$1" "$C_RESET"
+}
+
+# _wpm_menu_choice DEFAULT — baca pilihan menu, echo pada stdout.
+_wpm_menu_choice() {
+  prompt_default "Pilih menu" "${1:-0}"
+}
+
+# _wpm_prompt_number LABEL DEFAULT — ulangi sampai input berupa angka
+# (boleh desimal, untuk kelipatan load average). Echo hasil pada stdout.
+_wpm_prompt_number() {
+  local label="$1" default="$2" val
+  while true; do
+    val="$(prompt_default "$label" "$default")"
+    if [[ "$val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      printf '%s\n' "$val"
+      return 0
+    fi
+    printf '%sMasukkan angka yang valid.%s\n' "$C_RED" "$C_RESET" >&2
+  done
+}
+
+# _wpm_choose_app LABEL — tampilkan daftar app terdaftar (nomor + domain),
+# minta pengguna memilih satu, echo nama app pada stdout. Return 1 (tanpa
+# echo apa pun) bila pengguna memilih "0) Kembali" atau belum ada app sama
+# sekali. Semua prompt/listing ditulis ke stderr agar aman dipakai sebagai
+# app="$(_wpm_choose_app ...)".
+_wpm_choose_app() {
+  local label="${1:-Pilih app}"
+  local -a apps=()
+  mapfile -t apps < <(list_apps)
+
+  if (( ${#apps[@]} == 0 )); then
+    printf '%sBelum ada web app terdaftar. Clone atau import vhost dulu.%s\n' "$C_YELLOW" "$C_RESET" >&2
+    return 1
+  fi
+
+  printf '\n%s%s:%s\n' "$C_BOLD" "$label" "$C_RESET" >&2
+  local i
+  for i in "${!apps[@]}"; do
+    printf '  %2d) %-24s %s\n' "$((i + 1))" "${apps[$i]}" "$(app_get "${apps[$i]}" DOMAIN)" >&2
+  done
+  printf '   0) Kembali\n' >&2
+
+  local sel
+  while true; do
+    sel="$(prompt_default "Nomor app" "0")"
+    if [[ "$sel" == "0" ]]; then
+      return 1
+    fi
+    if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#apps[@]} )); then
+      printf '%s\n' "${apps[$((sel - 1))]}"
+      return 0
+    fi
+    printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET" >&2
+  done
+}
+
+# ============================================================================
+# F-1 — List Web Apps
+# ============================================================================
+
+# menu_list_web_apps — FR-01/FR-02: tabel gabungan registry + vhost manual
+# yang belum dikelola (via ols_parse_vhosts), dengan opsi import. Tidak
+# mengunci (read-only).
+menu_list_web_apps() {
+  _wpm_section "List Web Apps"
+
+  local -a apps=()
+  mapfile -t apps < <(list_apps)
+
+  if (( ${#apps[@]} == 0 )); then
+    printf '%sBelum ada web app terdaftar.%s\n' "$C_YELLOW" "$C_RESET"
+  else
+    printf '%s%-18s %-26s %-30s %-14s %-9s %-7s %8s%s\n' \
+      "$C_BOLD" "Nama" "Domain" "Docroot" "Database" "PHP" "SSL" "Disk" "$C_RESET"
+
+    local app domain docroot db php ssl_status ssl_disp size vh_root
+    for app in "${apps[@]}"; do
+      domain="$(app_get "$app" DOMAIN)";   [[ -z "$domain" ]] && domain="-"
+      docroot="$(app_get "$app" DOCROOT)"; [[ -z "$docroot" ]] && docroot="-"
+      db="$(app_get "$app" DB_NAME)";      [[ -z "$db" ]] && db="-"
+      php="$(app_get "$app" PHP_HANDLER)"; [[ -z "$php" ]] && php="-"
+      ssl_status="$(app_get "$app" SSL_STATUS)"
+      case "$ssl_status" in
+        active) ssl_disp="aktif" ;;
+        failed) ssl_disp="gagal" ;;
+        "" | none) ssl_disp="-" ;;
+        *) ssl_disp="$ssl_status" ;;
+      esac
+      vh_root="$(app_get "$app" VH_ROOT)"
+      size="-"
+      [[ -n "$vh_root" && -d "$vh_root" ]] && size="$(du -sh -- "$vh_root" 2>/dev/null | cut -f1)"
+      [[ -z "$size" ]] && size="-"
+
+      printf '%-18s %-26s %-30s %-14s %-9s %-7s %8s\n' \
+        "$app" "$domain" "$docroot" "$db" "$php" "$ssl_disp" "$size"
+    done
+  fi
+
+  # FR-02: deteksi vhost yang dibuat manual (belum ada di registry WPM).
+  local -a un_names=() un_vhroots=() un_confs=()
+  if [[ -f "$OLS_CONF" ]]; then
+    local name vhroot conf
+    while IFS=$'\t' read -r name vhroot conf; do
+      [[ -z "$name" ]] && continue
+      if ! app_exists "$name"; then
+        un_names+=("$name")
+        un_vhroots+=("$vhroot")
+        un_confs+=("$conf")
+      fi
+    done < <(ols_parse_vhosts)
+  fi
+
+  if (( ${#un_names[@]} > 0 )); then
+    printf '\n%sVhost belum terkelola (dibuat manual, belum ada di registry WPM):%s\n' "$C_YELLOW" "$C_RESET"
+    local i
+    for i in "${!un_names[@]}"; do
+      printf '  %2d) %-24s vhRoot=%s\n' "$((i + 1))" "${un_names[$i]}" "${un_vhroots[$i]}"
+    done
+
+    if confirm "Import salah satu vhost di atas ke registry WPM sekarang?" "default_n"; then
+      local sel
+      while true; do
+        sel="$(prompt_default "Nomor vhost yang akan diimport (0=batal)" "0")"
+        [[ "$sel" == "0" ]] && break
+        if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#un_names[@]} )); then
+          acquire_lock
+          if ols_import_vhost "${un_names[$((sel - 1))]}" "${un_vhroots[$((sel - 1))]}" "${un_confs[$((sel - 1))]}"; then
+            log_info "Vhost '${un_names[$((sel - 1))]}' berhasil diimport ke registry — kini bisa dipakai sebagai sumber clone."
+          else
+            log_error "Gagal mengimport vhost '${un_names[$((sel - 1))]}'. Lihat ${WPM_LOG_FILE}."
+          fi
+          break
+        fi
+        printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET" >&2
+      done
+    fi
+  fi
+
+  pause_enter
+}
+
+# ============================================================================
+# F-3 — Kelola Web App
+# ============================================================================
+
+# menu_manage_web_app — pilih app lalu tampilkan submenu §4.1 "Kelola Web
+# App" (PHP Settings / Redis ACL / Lihat Access Log / Retry SSL / Delete).
+menu_manage_web_app() {
+  while true; do
+    local app
+    app="$(_wpm_choose_app "Pilih app untuk dikelola")" || return 0
+    _wpm_manage_app_submenu "$app"
+  done
+}
+
+_wpm_manage_app_submenu() {
+  local app="$1"
+  while true; do
+    if ! app_exists "$app"; then
+      return 0
+    fi
+    _wpm_section "Kelola Web App: ${app}"
+    printf '  Domain : %s\n' "$(app_get "$app" DOMAIN)"
+    printf '  SSL    : %s\n' "$(app_get "$app" SSL_STATUS)"
+    printf '  PHP    : %s\n\n' "$(app_get "$app" PHP_HANDLER)"
+    printf ' 1) PHP Settings\n'
+    printf ' 2) Redis ACL\n'
+    printf ' 3) Lihat Access Log\n'
+    printf ' 4) Retry SSL\n'
+    printf ' 5) Delete Web App\n'
+    printf ' 0) Kembali ke daftar app\n'
+
+    local c
+    c="$(_wpm_menu_choice 0)"
+    case "$c" in
+      1) acquire_lock; menu_php_settings "$app" ;;
+      2) acquire_lock; menu_redis_acl "$app" ;;
+      3) menu_access_log "$app" ;;
+      4) acquire_lock; menu_retry_ssl "$app" ;;
+      5) acquire_lock; menu_delete_app "$app" ;;
+      0) return 0 ;;
+      *) printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET" ;;
+    esac
+  done
+}
+
+# --- F-3a · PHP Settings -----------------------------------------------------
+
+menu_php_settings() {
+  local app="$1"
+  while true; do
+    if ! app_exists "$app"; then return 0; fi
+    _wpm_section "PHP Settings: ${app}"
+    printf '  memory_limit        : %s\n' "$(php_ini_get "$app" memory_limit)"
+    printf '  upload_max_filesize : %s\n' "$(php_ini_get "$app" upload_max_filesize)"
+    printf '  post_max_size       : %s\n' "$(php_ini_get "$app" post_max_size)"
+    printf '  max_execution_time  : %s\n' "$(php_ini_get "$app" max_execution_time)"
+    printf '  max_input_vars      : %s\n' "$(php_ini_get "$app" max_input_vars)"
+    printf '  Versi PHP saat ini  : %s\n\n' "$(app_get "$app" PHP_HANDLER)"
+    printf ' 1) Terapkan preset (Low/Normal/High)\n'
+    printf ' 2) Atur manual (5 parameter)\n'
+    printf ' 3) Ganti versi PHP (lsphp)\n'
+    printf ' 0) Kembali\n'
+
+    local c
+    c="$(_wpm_menu_choice 0)"
+    case "$c" in
+      1)
+        printf '  1) Low    (memory 128M, upload/post 32M/34M, exec 60s)\n'
+        printf '  2) Normal (memory 256M, upload/post 64M/68M, exec 120s)\n'
+        printf '  3) High   (memory 512M, upload/post 128M/136M, exec 300s)\n'
+        local p preset_name=""
+        p="$(prompt_default "Pilih preset" "1")"
+        case "$p" in
+          1) preset_name="low" ;;
+          2) preset_name="normal" ;;
+          3) preset_name="high" ;;
+          *) printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET" ;;
+        esac
+        if [[ -n "$preset_name" ]] && confirm "Terapkan preset '${preset_name}' untuk '${app}'? (OLS akan direstart graceful)" "default_y"; then
+          php_apply_preset "$app" "$preset_name"
+        fi
+        ;;
+      2)
+        local mem up post ex iv
+        mem="$(prompt_default "memory_limit" "$(php_ini_get "$app" memory_limit)")"
+        up="$(prompt_default "upload_max_filesize" "$(php_ini_get "$app" upload_max_filesize)")"
+        post="$(prompt_default "post_max_size" "$(php_ini_get "$app" post_max_size)")"
+        ex="$(prompt_default "max_execution_time" "$(php_ini_get "$app" max_execution_time)")"
+        iv="$(prompt_default "max_input_vars" "$(php_ini_get "$app" max_input_vars)")"
+        if confirm "Simpan pengaturan PHP manual di atas untuk '${app}'? (OLS akan direstart graceful)" "default_y"; then
+          php_ini_set_all "$app" \
+            memory_limit="$mem" upload_max_filesize="$up" post_max_size="$post" \
+            max_execution_time="$ex" max_input_vars="$iv"
+        fi
+        ;;
+      3)
+        local -a versions=()
+        mapfile -t versions < <(php_list_installed_versions)
+        if (( ${#versions[@]} == 0 )); then
+          printf '%sTidak ditemukan versi lsphp terpasang di %s.%s\n' "$C_YELLOW" "$OLS_HOME" "$C_RESET"
+        else
+          local i
+          for i in "${!versions[@]}"; do
+            printf '  %d) %s\n' "$((i + 1))" "${versions[$i]}"
+          done
+          local sel
+          sel="$(prompt_default "Pilih versi PHP" "1")"
+          if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#versions[@]} )); then
+            local handler="${versions[$((sel - 1))]}"
+            if confirm "Ganti versi PHP '${app}' ke '${handler}'? (OLS akan direstart graceful)" "default_y"; then
+              php_set_version "$app" "$handler"
+            fi
+          else
+            printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET"
+          fi
+        fi
+        ;;
+      0) return 0 ;;
+      *) printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET" ;;
+    esac
+    pause_enter
+  done
+}
+
+# --- F-3b · Redis ACL --------------------------------------------------------
+
+# _wpm_redis_user_status USER — echo "aktif"/"nonaktif"/"tidak ditemukan"/"-"
+# berdasarkan flag on/off pada baris user di $REDIS_ACL_FILE.
+_wpm_redis_user_status() {
+  local user="$1"
+  if [[ -z "$user" || ! -f "$REDIS_ACL_FILE" ]]; then
+    printf '%s\n' "-"
+    return 0
+  fi
+  local line state
+  line="$(awk -v u="$user" '$1=="user" && $2==u { print; exit }' "$REDIS_ACL_FILE" 2>/dev/null)"
+  if [[ -z "$line" ]]; then
+    printf '%s\n' "tidak ditemukan"
+    return 0
+  fi
+  state="$(awk '{print $3}' <<<"$line")"
+  case "$state" in
+    on) printf '%s\n' "aktif" ;;
+    off) printf '%s\n' "nonaktif" ;;
+    *) printf '%s\n' "$state" ;;
+  esac
+}
+
+menu_redis_acl() {
+  local app="$1"
+  while true; do
+    if ! app_exists "$app"; then return 0; fi
+    local user pass dbid status
+    user="$(app_get "$app" REDIS_USER)"
+    pass="$(app_get "$app" REDIS_PASS)"
+    dbid="$(app_get "$app" REDIS_DB_ID)"
+    status="$(_wpm_redis_user_status "$user")"
+
+    _wpm_section "Redis ACL: ${app}"
+    printf '  User       : %s\n' "${user:--}"
+    printf '  DB ID      : %s\n' "${dbid:--}"
+    printf '  Prefix key : %s:*\n' "$app"
+    printf '  Status ACL : %s\n\n' "$status"
+    printf ' 1) Lihat kredensial lengkap\n'
+    printf ' 2) Regenerate password\n'
+    printf ' 3) Enable user\n'
+    printf ' 4) Disable user\n'
+    printf ' 0) Kembali\n'
+
+    local c
+    c="$(_wpm_menu_choice 0)"
+    case "$c" in
+      1)
+        if [[ -z "$user" ]]; then
+          printf '%sApp ini belum memiliki kredensial Redis (kemungkinan hasil import manual).%s\n' "$C_YELLOW" "$C_RESET"
+        else
+          printf '\n%sKredensial Redis — %s%s\n' "$C_YELLOW" "$app" "$C_RESET"
+          printf '  Host     : 127.0.0.1:6379\n'
+          printf '  User     : %s\n' "$user"
+          printf '  Password : %s\n' "$pass"
+          printf '  DB ID    : %s\n' "$dbid"
+        fi
+        ;;
+      2)
+        if [[ -z "$user" ]]; then
+          printf '%sTidak ada user Redis untuk app ini.%s\n' "$C_YELLOW" "$C_RESET"
+        else
+          redis_regen_password "$app"
+        fi
+        ;;
+      3)
+        if [[ -z "$user" ]]; then
+          printf '%sTidak ada user Redis untuk app ini.%s\n' "$C_YELLOW" "$C_RESET"
+        else
+          redis_set_enabled "$app" on
+        fi
+        ;;
+      4)
+        if [[ -z "$user" ]]; then
+          printf '%sTidak ada user Redis untuk app ini.%s\n' "$C_YELLOW" "$C_RESET"
+        else
+          redis_set_enabled "$app" off
+        fi
+        ;;
+      0) return 0 ;;
+      *) printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET" ;;
+    esac
+    pause_enter
+  done
+}
+
+# --- F-3c · Lihat Access Log --------------------------------------------------
+
+# menu_access_log APP — viewer §F-3c: tail live, Top 10 IP, Top 10 URL,
+# ringkasan status code, semua berbasis awk/sort/uniq (beban nyaris nol).
+# Read-only — tidak memerlukan acquire_lock.
+menu_access_log() {
+  local app="$1"
+  local vh_root logfile
+  vh_root="$(app_get "$app" VH_ROOT)"
+  logfile="${vh_root}/logs/access.log"
+
+  while true; do
+    if ! app_exists "$app"; then return 0; fi
+    _wpm_section "Lihat Access Log: ${app}"
+    printf '  File: %s\n' "$logfile"
+    if [[ ! -f "$logfile" ]]; then
+      printf '%s  (File log belum ada / belum ada traffic tercatat)%s\n' "$C_YELLOW" "$C_RESET"
+    fi
+    printf '\n 1) Tail log (live, Ctrl+C untuk kembali ke menu)\n'
+    printf ' 2) Top 10 IP\n'
+    printf ' 3) Top 10 URL\n'
+    printf ' 4) Ringkasan status code\n'
+    printf ' 0) Kembali\n'
+
+    local c
+    c="$(_wpm_menu_choice 0)"
+    case "$c" in
+      1)
+        if [[ -f "$logfile" ]]; then
+          printf '%sMenampilkan log secara live. Tekan Ctrl+C untuk kembali ke menu.%s\n' "$C_YELLOW" "$C_RESET"
+          # Isolasi SIGINT di subshell sendiri: Ctrl+C hanya menghentikan
+          # `tail -f` ini, tidak mematikan seluruh proses wpm (trap lock di
+          # core.sh tetap utuh karena tidak ada exit di shell utama).
+          ( trap 'exit 0' INT TERM; tail -n 50 -f -- "$logfile" )
+        else
+          printf '%sFile log belum ada.%s\n' "$C_YELLOW" "$C_RESET"
+        fi
+        ;;
+      2)
+        if [[ -f "$logfile" ]]; then
+          printf '\n%sTop 10 IP (berdasar jumlah request):%s\n' "$C_BOLD" "$C_RESET"
+          awk '{print $1}' -- "$logfile" 2>/dev/null \
+            | sort | uniq -c | sort -rn | head -n 10 \
+            | awk '{printf "  %6d  %s\n", $1, $2}'
+        else
+          printf '%sFile log belum ada.%s\n' "$C_YELLOW" "$C_RESET"
+        fi
+        ;;
+      3)
+        if [[ -f "$logfile" ]]; then
+          printf '\n%sTop 10 URL (berdasar jumlah request):%s\n' "$C_BOLD" "$C_RESET"
+          # Format log gaya Combined: IP - - [date] "METHOD /path HTTP/x" status size "ref" "agent"
+          # Split by " memberi field ke-2 = "METHOD /path HTTP/x".
+          awk -F'"' '{print $2}' -- "$logfile" 2>/dev/null \
+            | awk '{print $2}' \
+            | sort | uniq -c | sort -rn | head -n 10 \
+            | awk '{printf "  %6d  %s\n", $1, $2}'
+        else
+          printf '%sFile log belum ada.%s\n' "$C_YELLOW" "$C_RESET"
+        fi
+        ;;
+      4)
+        if [[ -f "$logfile" ]]; then
+          printf '\n%sRingkasan status code:%s\n' "$C_BOLD" "$C_RESET"
+          # Field ke-3 hasil split by " adalah " STATUS SIZE " — token
+          # pertamanya (setelah trim) adalah kode status HTTP.
+          awk -F'"' '{print $3}' -- "$logfile" 2>/dev/null \
+            | awk '{print $1}' \
+            | sort | uniq -c | sort -rn \
+            | awk '{printf "  %6d  %s\n", $1, $2}'
+        else
+          printf '%sFile log belum ada.%s\n' "$C_YELLOW" "$C_RESET"
+        fi
+        ;;
+      0) return 0 ;;
+      *) printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET" ;;
+    esac
+    pause_enter
+  done
+}
+
+# --- F-3d · Retry SSL ---------------------------------------------------------
+
+menu_retry_ssl() {
+  local app="$1"
+  local status
+  status="$(app_get "$app" SSL_STATUS)"
+  _wpm_section "Retry SSL: ${app}"
+  printf '  Status SSL saat ini: %s\n' "${status:-none}"
+  if confirm "Coba terbitkan/pasang ulang SSL untuk '${app}' sekarang?" "default_y"; then
+    ssl_retry "$app"
+  else
+    log_info "Retry SSL '${app}' dibatalkan."
+  fi
+  pause_enter
+}
+
+# --- F-3e · Delete Web App -----------------------------------------------------
+
+menu_delete_app() {
+  local app="$1"
+  app_delete "$app"
+  pause_enter
+}
+
+# ============================================================================
+# F-4 — Tools
+# ============================================================================
+
+menu_tools() {
+  while true; do
+    local app
+    app="$(_wpm_choose_app "Pilih app untuk Tools")" || return 0
+    _wpm_tools_submenu "$app"
+  done
+}
+
+_wpm_tools_submenu() {
+  local app="$1"
+  while true; do
+    if ! app_exists "$app"; then return 0; fi
+    _wpm_section "Tools: ${app}"
+    printf ' 1) Fix Ownership\n'
+    printf ' 2) Rebuild Web App Config\n'
+    printf ' 3) Clear Web App Cache\n'
+    printf ' 0) Kembali ke daftar app\n'
+
+    local c
+    c="$(_wpm_menu_choice 0)"
+    case "$c" in
+      1)
+        if confirm "Perbaiki ownership & permission file untuk '${app}'?" "default_y"; then
+          acquire_lock
+          tools_fix_ownership "$app"
+        fi
+        ;;
+      2)
+        if confirm "Bangun ulang konfigurasi vhost '${app}' dari snapshot/registry? (data situs tidak disentuh)" "default_y"; then
+          acquire_lock
+          tools_rebuild_config "$app"
+        fi
+        ;;
+      3)
+        if confirm "Hapus cache file (wp-content/cache, litespeed) & flush Redis DB milik '${app}'?" "default_y"; then
+          acquire_lock
+          tools_clear_cache "$app"
+        fi
+        ;;
+      0) return 0 ;;
+      *) printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET" ;;
+    esac
+    pause_enter
+  done
+}
+
+# ============================================================================
+# F-5 — Web Server Settings (OpenLiteSpeed)
+# ============================================================================
+
+# _wpm_webadmin_set_port PORT — patch baris "address" di dalam blok
+# listener {} pertama pada admin_config.conf (WebAdmin console, default
+# :7080), pertahankan host/bind address yang ada, hanya ganti nomor port.
+# Backup timestamped sebelum menulis (§5.5).
+_wpm_webadmin_set_port() {
+  local new_port="$1"
+  if [[ ! -f "$_WPM_WEBADMIN_CONF" ]]; then
+    log_error "_wpm_webadmin_set_port: konfigurasi WebAdmin tidak ditemukan: ${_WPM_WEBADMIN_CONF}"
+    return 1
+  fi
+
+  local ts backup
+  ts="$(date -u +%Y%m%d%H%M%S 2>/dev/null)"
+  backup="${_WPM_WEBADMIN_CONF}.bak-${ts}"
+  if ! cp -p "$_WPM_WEBADMIN_CONF" "$backup"; then
+    log_error "_wpm_webadmin_set_port: gagal membuat backup ${backup}"
+    return 1
+  fi
+  log_action "WebAdmin config dibackup ke ${backup}"
+
+  local tmp
+  tmp="$(mktemp)" || { log_error "_wpm_webadmin_set_port: mktemp gagal"; return 1; }
+
+  awk -v newport="$new_port" '
+    function trim(s) { gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s); return s }
+    BEGIN { in_l = 0 }
+    {
+      orig = $0
+      t = trim(orig)
+      n = split(t, w, /[ \t]+/)
+      if (!in_l) {
+        if (n >= 3 && w[1] == "listener" && w[n] == "{") { in_l = 1; print orig; next }
+        print orig
+        next
+      }
+      if (t == "}") { in_l = 0; print orig; next }
+      if (n >= 2 && w[1] == "address") {
+        host = w[2]
+        sub(/:[0-9]+$/, "", host)
+        match(orig, /^[ \t]*/); indent = substr(orig, RSTART, RLENGTH)
+        printf("%s%-24s%s:%s\n", indent, "address", host, newport)
+        next
+      }
+      print orig
+    }
+  ' "$_WPM_WEBADMIN_CONF" > "$tmp" && cat "$tmp" > "$_WPM_WEBADMIN_CONF"
+  rm -f "$tmp"
+
+  log_action "WebAdmin: port listener diganti ke ${new_port}"
+  return 0
+}
+
+# _wpm_webadmin_reset_password USER NEWPASS — reset password WebAdmin.
+# Password TIDAK diteruskan sebagai argumen CLI selama tool htpasswd yang
+# terpasang mendukung "-i" (baca dari stdin) — fallback ke "-b" (password
+# sebagai argumen, terlihat sesaat di ps aux) hanya bila "-i" gagal/tidak
+# didukung, dicatat sebagai peringatan.
+_wpm_webadmin_reset_password() {
+  local user="$1" newpass="$2"
+
+  if [[ ! -x "$_WPM_WEBADMIN_HTPASSWD_BIN" ]]; then
+    log_error "_wpm_webadmin_reset_password: alat '${_WPM_WEBADMIN_HTPASSWD_BIN}' tidak ditemukan/tidak dapat dieksekusi."
+    return 1
+  fi
+  mkdir -p "$(dirname "$_WPM_WEBADMIN_HTPASSWD_FILE")" 2>/dev/null
+
+  local args=(-i)
+  [[ -f "$_WPM_WEBADMIN_HTPASSWD_FILE" ]] || args+=(-c)
+  args+=("$_WPM_WEBADMIN_HTPASSWD_FILE" "$user")
+
+  if printf '%s\n' "$newpass" | "$_WPM_WEBADMIN_HTPASSWD_BIN" "${args[@]}" >>"$WPM_LOG_FILE" 2>&1; then
+    log_action "WebAdmin: password user '${user}' berhasil direset (stdin, ${_WPM_WEBADMIN_HTPASSWD_BIN})"
+    return 0
+  fi
+
+  log_warn "_wpm_webadmin_reset_password: opsi '-i' tampaknya tidak didukung, mencoba mode '-b'..."
+  args=(-b)
+  [[ -f "$_WPM_WEBADMIN_HTPASSWD_FILE" ]] || args+=(-c)
+  args+=("$_WPM_WEBADMIN_HTPASSWD_FILE" "$user" "$newpass")
+  if "$_WPM_WEBADMIN_HTPASSWD_BIN" "${args[@]}" >>"$WPM_LOG_FILE" 2>&1; then
+    log_action "WebAdmin: password user '${user}' berhasil direset (-b, ${_WPM_WEBADMIN_HTPASSWD_BIN})"
+    return 0
+  fi
+
+  log_error "_wpm_webadmin_reset_password: gagal mereset password WebAdmin untuk user '${user}'."
+  return 1
+}
+
+# _wpm_ols_tuning_set KEY VALUE — upsert satu directive di dalam blok
+# top-level `tuning { }` pada $OLS_CONF (brace-depth tracking, sama seperti
+# idiom lib/ols.sh). Menambahkan blok tuning{} baru di akhir file bila
+# belum ada sama sekali. Tidak backup/restart sendiri — dipanggil beberapa
+# kali berturut-turut oleh menu_ws_tuning_preset yang membungkusnya dengan
+# satu ols_backup_config + satu ols_graceful_restart di akhir.
+_wpm_ols_tuning_set() {
+  local key="$1" value="$2"
+  if [[ ! -f "$OLS_CONF" ]]; then
+    log_error "_wpm_ols_tuning_set: ${OLS_CONF} tidak ditemukan"
+    return 1
+  fi
+
+  local tmp
+  tmp="$(mktemp)" || { log_error "_wpm_ols_tuning_set: mktemp gagal"; return 1; }
+
+  awk -v key="$key" -v value="$value" '
+    function trim(s) { gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s); return s }
+    BEGIN { in_t = 0; depth = 0; done = 0 }
+    {
+      orig = $0
+      t = trim(orig)
+      n = split(t, w, /[ \t]+/)
+
+      if (!in_t) {
+        if (n >= 2 && w[1] == "tuning" && w[n] == "{") { in_t = 1; depth = 1; print orig; next }
+        print orig
+        next
+      }
+
+      o = gsub(/\{/, "{", orig); c = gsub(/\}/, "}", orig)
+
+      if (n >= 2 && w[1] == key && !done) {
+        printf("  %-24s%s\n", key, value)
+        done = 1
+        depth += (o - c)
+        if (depth <= 0) in_t = 0
+        next
+      }
+
+      depth += (o - c)
+      if (depth <= 0) {
+        if (!done) { printf("  %-24s%s\n", key, value); done = 1 }
+        in_t = 0
+        print orig
+        next
+      }
+      print orig
+    }
+    END {
+      if (!done) {
+        print "tuning  {"
+        printf("  %-24s%s\n", key, value)
+        print "}"
+      }
+    }
+  ' "$OLS_CONF" > "$tmp" && cat "$tmp" > "$OLS_CONF"
+  rm -f "$tmp"
+
+  log_action "Web Server Settings: tuning.${key} = ${value}"
+  return 0
+}
+
+menu_ws_restart() {
+  _wpm_section "Restart / Reload Graceful"
+  if confirm "Restart graceful OpenLiteSpeed sekarang? (tidak memutus koneksi aktif)" "default_y"; then
+    acquire_lock
+    if ols_graceful_restart; then
+      log_info "OLS berhasil direstart (graceful)."
+    else
+      log_error "Restart graceful OLS gagal — lihat ${WPM_LOG_FILE}."
+    fi
+  fi
+  pause_enter
+}
+
+menu_ws_webadmin() {
+  acquire_lock
+  _wpm_section "Ganti Port & Password WebAdmin"
+  printf ' 1) Ganti port WebAdmin\n'
+  printf ' 2) Reset password WebAdmin\n'
+  printf ' 0) Kembali\n'
+
+  local c
+  c="$(_wpm_menu_choice 0)"
+  case "$c" in
+    1)
+      local newport
+      newport="$(prompt_default "Port baru untuk WebAdmin" "7080")"
+      if [[ ! "$newport" =~ ^[0-9]{2,5}$ ]] || (( newport < 1 || newport > 65535 )); then
+        printf '%sPort tidak valid.%s\n' "$C_RED" "$C_RESET"
+      elif confirm "Ganti port WebAdmin menjadi ${newport}? OLS akan direstart graceful." "default_n"; then
+        if _wpm_webadmin_set_port "$newport" && ols_graceful_restart; then
+          log_info "Port WebAdmin berhasil diganti ke ${newport}. Akses baru: https://<ip-vps>:${newport}"
+        else
+          log_error "Gagal mengganti port WebAdmin — lihat ${WPM_LOG_FILE}."
+        fi
+      fi
+      ;;
+    2)
+      local user
+      user="$(prompt_default "Username WebAdmin" "admin")"
+      if confirm "Generate password baru acak (24 karakter) untuk WebAdmin user '${user}'?" "default_y"; then
+        local newpass
+        newpass="$(rand_password 24)"
+        if _wpm_webadmin_reset_password "$user" "$newpass"; then
+          printf '\n%sPassword WebAdmin baru untuk %s:%s\n' "$C_GREEN" "$user" "$C_RESET"
+          printf '  %s\n' "$newpass"
+          printf '%sCatat sekarang — tidak akan ditampilkan lagi.%s\n' "$C_YELLOW" "$C_RESET"
+        else
+          log_error "Gagal reset password WebAdmin — lihat ${WPM_LOG_FILE}."
+        fi
+      fi
+      ;;
+    0) ;;
+    *) printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET" ;;
+  esac
+  pause_enter
+}
+
+menu_ws_tuning_preset() {
+  acquire_lock
+  _wpm_section "Preset Tuning Low-End (§F-5)"
+  printf 'Preset ini disetel untuk VPS 1 vCPU / 1 GB RAM:\n'
+  printf '  maxConnections          200\n'
+  printf '  maxSSLConnections       100\n'
+  printf '  connTimeout             300\n'
+  printf '  smartKeepAlive          0\n'
+  printf '  keepAliveTimeout        5\n'
+  printf '  maxKeepAliveReq         1000\n\n'
+
+  if ! confirm "Terapkan preset tuning low-end di atas sekarang? (httpd_config.conf akan dibackup dulu)" "default_n"; then
+    log_info "Preset tuning low-end dibatalkan."
+    pause_enter
+    return 0
+  fi
+
+  ols_backup_config || log_warn "menu_ws_tuning_preset: ols_backup_config gagal (dilanjutkan)"
+
+  _wpm_ols_tuning_set maxConnections 200
+  _wpm_ols_tuning_set maxSSLConnections 100
+  _wpm_ols_tuning_set connTimeout 300
+  _wpm_ols_tuning_set smartKeepAlive 0
+  _wpm_ols_tuning_set keepAliveTimeout 5
+  _wpm_ols_tuning_set maxKeepAliveReq 1000
+
+  log_action "Web Server Settings: preset tuning low-end diterapkan"
+
+  if ols_graceful_restart; then
+    log_info "Preset tuning low-end diterapkan & OLS berhasil direstart."
+  else
+    log_error "Preset diterapkan, tapi restart graceful gagal — periksa OLS secara manual (backup tersedia di ${OLS_CONF}.bak-*)."
+  fi
+  pause_enter
+}
+
+menu_ws_edit_conf() {
+  acquire_lock
+  _wpm_section "Edit httpd_config.conf"
+
+  if [[ ! -f "$OLS_CONF" ]]; then
+    log_error "menu_ws_edit_conf: ${OLS_CONF} tidak ditemukan."
+    pause_enter
+    return 0
+  fi
+
+  ols_backup_config || log_warn "menu_ws_edit_conf: ols_backup_config gagal (dilanjutkan)"
+
+  local editor="${EDITOR:-}"
+  if [[ -z "$editor" ]] || ! command -v "$editor" >/dev/null 2>&1; then
+    if command -v nano >/dev/null 2>&1; then
+      editor="nano"
+    elif command -v vim >/dev/null 2>&1; then
+      editor="vim"
+    else
+      editor="vi"
+    fi
+  fi
+
+  printf '\n%sMembuka %s dengan %s (sudah dibackup otomatis, §5.5).%s\n' "$C_YELLOW" "$OLS_CONF" "$editor" "$C_RESET"
+  pause_enter
+  "$editor" "$OLS_CONF"
+  log_action "Web Server Settings: httpd_config.conf diedit manual via ${editor}"
+
+  if confirm "Simpan selesai. Restart graceful sekarang untuk menerapkan perubahan?" "default_y"; then
+    if ols_graceful_restart; then
+      log_info "OLS berhasil direstart dengan konfigurasi baru."
+    else
+      log_error "Restart graceful gagal — periksa syntax httpd_config.conf (bisa dipulihkan dari backup .bak-* bila perlu)."
+    fi
+  else
+    log_warn "Restart dilewati — perubahan belum diterapkan sampai restart berikutnya."
+  fi
+  pause_enter
+}
+
+menu_ws_staging_php_default() {
+  acquire_lock
+  _wpm_section "PHP Default untuk Clone dari Staging"
+
+  local current
+  current="$(staging_conf_get DEFAULT_PHP_HANDLER)"
+  if [[ -z "$current" ]]; then
+    printf '  Versi PHP default saat ini: %sbelum diatur (pakai versi lsphp pertama yang terdeteksi otomatis)%s\n\n' "$C_YELLOW" "$C_RESET"
+  else
+    printf '  Versi PHP default saat ini: %s\n\n' "$current"
+  fi
+
+  local -a versions=()
+  mapfile -t versions < <(php_list_installed_versions)
+  if (( ${#versions[@]} == 0 )); then
+    printf '%sTidak ditemukan versi lsphp terpasang di %s.%s\n' "$C_YELLOW" "$OLS_HOME" "$C_RESET"
+  else
+    local i
+    for i in "${!versions[@]}"; do
+      printf '  %d) %s\n' "$((i + 1))" "${versions[$i]}"
+    done
+    local sel
+    sel="$(prompt_default "Pilih versi PHP default untuk clone dari staging" "1")"
+    if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#versions[@]} )); then
+      local handler="${versions[$((sel - 1))]}"
+      if confirm "Jadikan '${handler}' sebagai versi PHP default untuk semua clone dari staging?" "default_y"; then
+        staging_conf_set_all DEFAULT_PHP_HANDLER="$handler"
+        log_info "Versi PHP default untuk clone dari staging diset ke '${handler}'."
+      fi
+    else
+      printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET"
+    fi
+  fi
+  pause_enter
+}
+
+menu_webserver_settings() {
+  while true; do
+    _wpm_section "Web Server Settings (OpenLiteSpeed)"
+    printf ' 1) Restart / Reload Graceful\n'
+    printf ' 2) Ganti Port & Password WebAdmin\n'
+    printf ' 3) Preset Tuning Low-End\n'
+    printf ' 4) Edit httpd_config.conf\n'
+    printf ' 5) PHP Default untuk Clone dari Staging\n'
+    printf ' 0) Kembali ke menu utama\n'
+
+    local c
+    c="$(_wpm_menu_choice 0)"
+    case "$c" in
+      1) menu_ws_restart ;;
+      2) menu_ws_webadmin ;;
+      3) menu_ws_tuning_preset ;;
+      4) menu_ws_edit_conf ;;
+      5) menu_ws_staging_php_default ;;
+      0) return 0 ;;
+      *) printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET" ;;
+    esac
+  done
+}
+
+# ============================================================================
+# F-6 — Telegram & Monitoring
+# ============================================================================
+
+# --- toggle "alert monitor" via /etc/cron.d/wpm-monitor ---------------------
+
+# _wpm_monitor_cron_status — echo "aktif" / "nonaktif" / "belum_terpasang".
+_wpm_monitor_cron_status() {
+  if [[ ! -f "$_WPM_CRON_FILE" ]]; then
+    printf '%s\n' "belum_terpasang"
+    return 0
+  fi
+  if grep -qE '^[^#[:space:]].*monitor\.sh' "$_WPM_CRON_FILE" 2>/dev/null; then
+    printf '%s\n' "aktif"
+  else
+    printf '%s\n' "nonaktif"
+  fi
+}
+
+# _wpm_monitor_cron_enable — pasang/aktifkan kembali baris cron 1-menit
+# yang menjalankan $WPM_HOME/monitor.sh (§F-6a/§5.3).
+_wpm_monitor_cron_enable() {
+  local wpm_home="${WPM_HOME:-/usr/local/share/wpm}"
+  mkdir -p "$(dirname "$_WPM_CRON_FILE")" 2>/dev/null
+
+  if [[ ! -f "$_WPM_CRON_FILE" ]]; then
+    {
+      printf '# WPM — cron alert monitor (§F-6a). Kelola lewat: wpm > 6 > Nyalakan/matikan alert monitor.\n'
+      printf '* * * * * root %s/monitor.sh >/dev/null 2>&1\n' "$wpm_home"
+    } > "$_WPM_CRON_FILE"
+  elif grep -q '^# DISABLED-BY-WPM: ' "$_WPM_CRON_FILE" 2>/dev/null; then
+    sed -i 's/^# DISABLED-BY-WPM: //' "$_WPM_CRON_FILE"
+  elif ! grep -qE '^\*.*monitor\.sh' "$_WPM_CRON_FILE" 2>/dev/null; then
+    printf '* * * * * root %s/monitor.sh >/dev/null 2>&1\n' "$wpm_home" >> "$_WPM_CRON_FILE"
+  fi
+  chmod 644 "$_WPM_CRON_FILE" 2>/dev/null
+
+  log_action "wpm: cron alert monitor diaktifkan (${_WPM_CRON_FILE})"
+  return 0
+}
+
+# _wpm_monitor_cron_disable — komentari baris cron aktif (tanpa menghapus
+# file, agar mudah diaktifkan kembali).
+_wpm_monitor_cron_disable() {
+  if [[ ! -f "$_WPM_CRON_FILE" ]]; then
+    log_warn "Cron alert monitor belum terpasang, tidak ada yang dinonaktifkan."
+    return 1
+  fi
+  sed -i -E 's/^([^#[:space:]].*monitor\.sh.*)$/# DISABLED-BY-WPM: \1/' "$_WPM_CRON_FILE"
+  log_action "wpm: cron alert monitor dinonaktifkan (${_WPM_CRON_FILE})"
+  return 0
+}
+
+# --- toggle "bot interaktif" via systemd -------------------------------------
+
+# _wpm_bot_status — echo "aktif" / "nonaktif" / "belum_terpasang".
+_wpm_bot_status() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    printf '%s\n' "belum_terpasang"
+    return 0
+  fi
+  if ! systemctl list-unit-files --no-legend "$_WPM_BOT_SERVICE" 2>/dev/null | grep -q "$_WPM_BOT_SERVICE"; then
+    printf '%s\n' "belum_terpasang"
+    return 0
+  fi
+  if systemctl is-active --quiet "$_WPM_BOT_SERVICE" 2>/dev/null; then
+    printf '%s\n' "aktif"
+  else
+    printf '%s\n' "nonaktif"
+  fi
+}
+
+_wpm_bot_enable() {
+  require_cmd systemctl
+  if systemctl enable --now "$_WPM_BOT_SERVICE" >>"$WPM_LOG_FILE" 2>&1; then
+    log_action "wpm: bot interaktif (${_WPM_BOT_SERVICE}) diaktifkan"
+    return 0
+  fi
+  log_error "Gagal mengaktifkan ${_WPM_BOT_SERVICE} — lihat ${WPM_LOG_FILE}."
+  return 1
+}
+
+_wpm_bot_disable() {
+  require_cmd systemctl
+  if systemctl disable --now "$_WPM_BOT_SERVICE" >>"$WPM_LOG_FILE" 2>&1; then
+    log_action "wpm: bot interaktif (${_WPM_BOT_SERVICE}) dimatikan"
+    return 0
+  fi
+  log_error "Gagal mematikan ${_WPM_BOT_SERVICE} — lihat ${WPM_LOG_FILE}."
+  return 1
+}
+
+# --- submenu items -----------------------------------------------------------
+
+menu_telegram_setup() {
+  acquire_lock
+  tg_setup_wizard
+  pause_enter
+}
+
+menu_telegram_thresholds() {
+  acquire_lock
+  local bot_token chat_id alerts_enabled
+  local th_load th_ram th_ram_rec th_swap th_swap_rec th_disk realert auto_restart label
+
+  bot_token="$(telegram_conf_get BOT_TOKEN)"
+  chat_id="$(telegram_conf_get CHAT_ID)"
+  alerts_enabled="$(telegram_conf_get ALERTS_ENABLED)"
+  th_load="$(telegram_conf_get TH_LOAD_MULT)"
+  th_ram="$(telegram_conf_get TH_RAM)"
+  th_ram_rec="$(telegram_conf_get TH_RAM_RECOVER)"
+  th_swap="$(telegram_conf_get TH_SWAP)"
+  th_swap_rec="$(telegram_conf_get TH_SWAP_RECOVER)"
+  th_disk="$(telegram_conf_get TH_DISK)"
+  realert="$(telegram_conf_get REALERT_MIN)"
+  auto_restart="$(telegram_conf_get AUTO_RESTART)"
+  label="$(telegram_conf_get LABEL)"
+
+  _wpm_section "Atur Threshold Alert"
+  printf 'Tekan Enter untuk memakai nilai saat ini.\n\n'
+
+  th_load="$(_wpm_prompt_number "Kelipatan load average (core × N)" "$th_load")"
+  th_ram="$(_wpm_prompt_number "Ambang RAM alert (%)" "$th_ram")"
+  th_ram_rec="$(_wpm_prompt_number "Ambang RAM pulih/recover (%)" "$th_ram_rec")"
+  th_swap="$(_wpm_prompt_number "Ambang Swap alert (%)" "$th_swap")"
+  th_swap_rec="$(_wpm_prompt_number "Ambang Swap pulih/recover (%)" "$th_swap_rec")"
+  th_disk="$(_wpm_prompt_number "Ambang Disk / alert (%)" "$th_disk")"
+  realert="$(_wpm_prompt_number "Interval re-alert (menit)" "$realert")"
+
+  local auto_default="default_n"
+  [[ "$auto_restart" == "1" ]] && auto_default="default_y"
+  if confirm "Auto-restart service yang down (OLS/MariaDB/Redis)?" "$auto_default"; then
+    auto_restart="1"
+  else
+    auto_restart="0"
+  fi
+  label="$(prompt_default "Label nama server (untuk pesan Telegram)" "$label")"
+
+  if confirm "Simpan pengaturan threshold di atas?" "default_y"; then
+    telegram_conf_set_all \
+      BOT_TOKEN="$bot_token" CHAT_ID="$chat_id" ALERTS_ENABLED="$alerts_enabled" \
+      TH_LOAD_MULT="$th_load" TH_RAM="$th_ram" TH_RAM_RECOVER="$th_ram_rec" \
+      TH_SWAP="$th_swap" TH_SWAP_RECOVER="$th_swap_rec" TH_DISK="$th_disk" \
+      REALERT_MIN="$realert" AUTO_RESTART="$auto_restart" LABEL="$label"
+    log_info "Threshold alert berhasil diperbarui."
+  else
+    log_info "Perubahan threshold dibatalkan."
+  fi
+  pause_enter
+}
+
+menu_telegram_monitor_toggle() {
+  acquire_lock
+  local status
+  status="$(_wpm_monitor_cron_status)"
+  _wpm_section "Nyalakan/Matikan Alert Monitor"
+  printf '  Status cron alert monitor saat ini: %s\n' "$status"
+
+  case "$status" in
+    aktif)
+      if confirm "Matikan alert monitor sekarang?" "default_n"; then
+        if _wpm_monitor_cron_disable; then
+          log_info "Alert monitor dimatikan."
+        else
+          log_error "Gagal mematikan alert monitor."
+        fi
+      fi
+      ;;
+    nonaktif | belum_terpasang)
+      if confirm "Nyalakan alert monitor sekarang (cron setiap 1 menit)?" "default_y"; then
+        if _wpm_monitor_cron_enable; then
+          log_info "Alert monitor dinyalakan."
+        else
+          log_error "Gagal menyalakan alert monitor."
+        fi
+      fi
+      ;;
+  esac
+  pause_enter
+}
+
+menu_telegram_bot_toggle() {
+  acquire_lock
+  local status
+  status="$(_wpm_bot_status)"
+  _wpm_section "Nyalakan/Matikan Bot Interaktif"
+  printf '  Status systemd unit (%s) saat ini: %s\n' "$_WPM_BOT_SERVICE" "$status"
+
+  case "$status" in
+    aktif)
+      if confirm "Matikan bot interaktif sekarang? (alert monitor tidak terpengaruh)" "default_n"; then
+        if _wpm_bot_disable; then
+          log_info "Bot interaktif dimatikan."
+        else
+          log_error "Gagal mematikan bot interaktif."
+        fi
+      fi
+      ;;
+    nonaktif)
+      if confirm "Nyalakan bot interaktif sekarang?" "default_y"; then
+        if _wpm_bot_enable; then
+          log_info "Bot interaktif dinyalakan."
+        else
+          log_error "Gagal menyalakan bot interaktif."
+        fi
+      fi
+      ;;
+    belum_terpasang)
+      printf '%sUnit systemd %s belum terpasang. Jalankan ulang install.sh untuk memasangnya.%s\n' \
+        "$C_YELLOW" "$_WPM_BOT_SERVICE" "$C_RESET"
+      ;;
+  esac
+  pause_enter
+}
+
+menu_telegram_test() {
+  local token chat
+  token="$(telegram_conf_get BOT_TOKEN)"
+  chat="$(telegram_conf_get CHAT_ID)"
+
+  _wpm_section "Kirim Tes Notifikasi"
+  if [[ -z "$token" || -z "$chat" ]]; then
+    log_error "Telegram belum disetel. Jalankan 'Setup bot' terlebih dahulu."
+    pause_enter
+    return 0
+  fi
+
+  if tg_send "🔔 Ini pesan tes dari WPM. Jika Anda menerima ini, integrasi Telegram berfungsi dengan baik."; then
+    log_info "Pesan tes berhasil dikirim."
+  else
+    log_error "Gagal mengirim pesan tes — periksa token/chat ID/koneksi internet."
+  fi
+  pause_enter
+}
+
+menu_telegram() {
+  while true; do
+    _wpm_section "Telegram & Monitoring"
+    printf '  Alert monitor  : %s\n' "$(_wpm_monitor_cron_status)"
+    printf '  Bot interaktif : %s\n\n' "$(_wpm_bot_status)"
+    printf ' 1) Setup bot (token + chat ID + tes)\n'
+    printf ' 2) Atur threshold alert\n'
+    printf ' 3) Nyalakan/matikan alert monitor\n'
+    printf ' 4) Nyalakan/matikan bot interaktif\n'
+    printf ' 5) Kirim tes notifikasi\n'
+    printf ' 0) Kembali ke menu utama\n'
+
+    local c
+    c="$(_wpm_menu_choice 0)"
+    case "$c" in
+      1) menu_telegram_setup ;;
+      2) menu_telegram_thresholds ;;
+      3) menu_telegram_monitor_toggle ;;
+      4) menu_telegram_bot_toggle ;;
+      5) menu_telegram_test ;;
+      0) return 0 ;;
+      *) printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET" ;;
+    esac
+  done
+}
+
+# ============================================================================
+# Menu utama
+# ============================================================================
+
+main_menu() {
+  while true; do
+    _wpm_banner
+    printf '\n'
+    printf ' 1) List Web Apps\n'
+    printf ' 2) Clone Web App\n'
+    printf ' 3) Kelola Web App\n'
+    printf ' 4) Tools\n'
+    printf ' 5) Web Server Settings (OpenLiteSpeed)\n'
+    printf ' 6) Telegram & Monitoring\n'
+    printf ' 0) Keluar\n\n'
+
+    local choice
+    choice="$(_wpm_menu_choice 0)"
+    case "$choice" in
+      1) menu_list_web_apps ;;
+      2)
+        acquire_lock
+        clone_wizard
+        pause_enter
+        ;;
+      3) menu_manage_web_app ;;
+      4) menu_tools ;;
+      5) menu_webserver_settings ;;
+      6) menu_telegram ;;
+      0)
+        printf '%sSampai jumpa.%s\n' "$C_CYAN" "$C_RESET"
+        exit 0
+        ;;
+      *)
+        printf '%sPilihan tidak valid.%s\n' "$C_RED" "$C_RESET"
+        ;;
+    esac
+  done
+}
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+main() {
+  case "${1:-}" in
+    --version | -v)
+      printf 'wpm %s\n' "$WPM_VERSION"
+      exit 0
+      ;;
+    --help | -h)
+      printf 'Pemakaian: wpm\n\nMenjalankan menu interaktif WPM (WordPress Manager untuk OpenLiteSpeed).\nJalankan tanpa argumen sebagai root, lalu ikuti menu angka.\n'
+      exit 0
+      ;;
+  esac
+
+  require_root
+
+  if [[ ! -x "$OLS_CTRL" ]]; then
+    log_warn "Skrip kontrol OpenLiteSpeed tidak ditemukan di ${OLS_CTRL}. Sebagian fitur (restart, vhost) tidak akan berfungsi sampai OLS terpasang dengan benar."
+  fi
+
+  main_menu
+}
+
+main "$@"
