@@ -245,7 +245,15 @@ ols_http_listener_name() {
 
   local target_name="Default"
   _ols_listener_block_exists "$target_name" && target_name="WPM_HTTP"
-  _ols_create_listener "$target_name" 80 >/dev/null 2>&1
+  # NOTE: only stdout is suppressed here (defense in depth — this function
+  # is itself always called via `$(...)`, and stdout is what gets
+  # captured/corrupted; stderr is NOT captured by `$(...)` and must be left
+  # alone so a real log_error from a failed auto-create is still visible to
+  # whoever is running `wpm` interactively, instead of being silently
+  # swallowed with no explanation).
+  if ! _ols_create_listener "$target_name" 80 >/dev/null; then
+    log_error "ols_http_listener_name: gagal membuat listener HTTP otomatis untuk port :80 (lihat pesan di atas dan ${WPM_LOG_FILE} untuk detail — periksa permission tulis pada ${OLS_CONF})"
+  fi
   printf '%s\n' "$target_name"
 }
 
@@ -263,7 +271,11 @@ ols_https_listener_name() {
   local certinfo key crt
   if certinfo="$(_ols_ensure_selfsigned_cert)"; then
     read -r key crt <<<"$certinfo"
-    _ols_create_listener "$target_name" 443 "$key" "$crt" >/dev/null 2>&1
+    if ! _ols_create_listener "$target_name" 443 "$key" "$crt" >/dev/null; then
+      log_error "ols_https_listener_name: gagal membuat listener HTTPS otomatis untuk port :443 (lihat pesan di atas dan ${WPM_LOG_FILE} untuk detail — periksa permission tulis pada ${OLS_CONF})"
+    fi
+  else
+    log_error "ols_https_listener_name: gagal menyiapkan sertifikat self-signed sementara (openssl tidak ditemukan, atau gagal generate) — listener HTTPS tidak dibuat otomatis"
   fi
   printf '%s\n' "$target_name"
 }
