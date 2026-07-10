@@ -417,15 +417,25 @@ clone_rollback() {
 #
 # Runs the §F-2 8-step pipeline for a single planned clone, in exact order:
 #   [1/8] rsync source VH_ROOT -> new VH_ROOT (exclude wp-content/cache,
-#         wp-content/litespeed, and the old app's logs/)
+#         wp-content/litespeed, wp-content/object-cache.php, and the old
+#         app's logs/)
 #   [2/8] CREATE DATABASE + user (random 24-char password)
 #   [3/8] streaming mysqldump | mysql import (db_dump_import)
 #   [4/8] patch wp-config.php: new DB creds, fresh salts, new Redis creds
-#   [5/8] wp search-replace old domain -> new domain (safe for serialized
-#         data — never sed)
-#   [6/8] copy+patch vhconf, write virtualhost block + :80 listener map,
+#   [5/8] copy+patch vhconf, write virtualhost block + :80 listener map,
 #         graceful restart
-#   [7/8] fix ownership
+#   [6/8] fix ownership
+#   [7/8] wp search-replace old domain -> new domain (safe for serialized
+#         data — never sed). Deliberately runs LAST among the "must
+#         succeed" steps (not right after [4/8] like earlier versions of
+#         this pipeline) — field investigation showed a correctly
+#         search-replaced siteurl/home could still read back as the old
+#         domain once the ENTIRE pipeline (including step [8/8]'s several
+#         wp-cli invocations for LSCWP/Redis sync) had finished, even
+#         though no single wp-cli command in [8/8] reproduced it in
+#         isolation. Running search-replace last, right before the
+#         non-blocking tail, makes its result the final word regardless of
+#         whatever [8/8] does afterward.
 #   [8/8] DNS check -> certbot -> vhssl + :443 map -> restart -> Redis ACL
 #         user -> LSCWP credential sync + purge (non-blocking)
 #
@@ -599,40 +609,18 @@ clone_execute_one() {
   fi
   log_action "clone_execute_one[${new_app}]: [4/8] wp-config.php dipatch"
 
-  # Defensive: kalau app sumber punya drop-in object-cache.php (LiteSpeed
-  # Cache atau plugin cache lain) yang somehow ikut tersalin meski sudah
-  # di-exclude di [1/8], pastikan tidak ada nilai yang di-cache dari
-  # sebelum clone yang ikut terbawa — non-fatal, murni pencegahan.
-  _clone_wp_run "$new_docroot" cache flush >>"$WPM_LOG_FILE" 2>&1 \
-    || log_warn "clone_execute_one[${new_app}]: 'wp cache flush' gagal (non-fatal)"
-
-  # --- [5/8] wp search-replace domain lama -> domain baru ----------------
-  log_info "[5/8] wp search-replace domain lama -> domain baru (aman untuk data serialized)..."
-  local src_domain
-  src_domain="$(app_get "$src_app" DOMAIN)"
-  if [[ -z "$src_domain" ]]; then
-    _clone_step_failed "$new_app" "[5/8] search-replace" "domain app sumber tidak diketahui"
-    return 1
-  fi
-  if ! _clone_wp_run "$new_docroot" search-replace "$src_domain" "$new_domain" \
-        --all-tables --skip-columns=guid >>"$WPM_LOG_FILE" 2>&1; then
-    _clone_step_failed "$new_app" "[5/8] search-replace" "wp search-replace gagal"
-    return 1
-  fi
-  log_action "clone_execute_one[${new_app}]: [5/8] search-replace ${src_domain} -> ${new_domain} selesai"
-
-  # --- [6/8] vhconf copy+patch + virtualhost block + listener map + restart
-  log_info "[6/8] Menyalin & mem-patch vhconf, menambah virtualhost + listener, restart graceful..."
+  # --- [5/8] vhconf copy+patch + virtualhost block + listener map + restart
+  log_info "[5/8] Menyalin & mem-patch vhconf, menambah virtualhost + listener, restart graceful..."
   local new_vhconf
   new_vhconf="$(ols_copy_and_patch_vhconf "$src_app" "$new_app" "$new_domain")"
   if [[ -z "$new_vhconf" || ! -f "$new_vhconf" ]]; then
-    _clone_step_failed "$new_app" "[6/8] vhconf" "gagal menyalin/mem-patch vhconf dari '${src_app}'"
+    _clone_step_failed "$new_app" "[5/8] vhconf" "gagal menyalin/mem-patch vhconf dari '${src_app}'"
     return 1
   fi
   ols_set_access_log "$new_app" \
     || log_warn "clone_execute_one[${new_app}]: normalisasi access log gagal (non-fatal, bisa diperbaiki via Rebuild Config)"
   if ! ols_write_vhost_block "$new_app" "$new_vh_root" "$new_vhconf"; then
-    _clone_step_failed "$new_app" "[6/8] vhconf" "gagal menulis blok virtualhost"
+    _clone_step_failed "$new_app" "[5/8] vhconf" "gagal menulis blok virtualhost"
     return 1
   fi
   # NOTE: ols_write_listener_map returns 1 (does not die/exit) if no
@@ -642,24 +630,51 @@ clone_execute_one() {
   # "Default", e.g. the stock "Example" listener), falling back to the
   # literal "Default" only if nothing is bound to :80 at all.
   if ! ols_write_listener_map "$(ols_http_listener_name)" "$new_app" "$new_domain"; then
-    _clone_step_failed "$new_app" "[6/8] vhconf" "gagal memetakan listener HTTP (:80)"
+    _clone_step_failed "$new_app" "[5/8] vhconf" "gagal memetakan listener HTTP (:80)"
     return 1
   fi
   ols_snapshot_vhconf "$new_app" \
     || log_warn "clone_execute_one[${new_app}]: snapshot vhconf gagal (non-fatal)"
   if ! ols_graceful_restart; then
-    _clone_step_failed "$new_app" "[6/8] vhconf" "restart graceful OLS gagal"
+    _clone_step_failed "$new_app" "[5/8] vhconf" "restart graceful OLS gagal"
     return 1
   fi
-  log_action "clone_execute_one[${new_app}]: [6/8] vhconf+virtualhost+listener+restart selesai"
+  log_action "clone_execute_one[${new_app}]: [5/8] vhconf+virtualhost+listener+restart selesai"
 
-  # --- [7/8] fix ownership -------------------------------------------------
-  log_info "[7/8] Memperbaiki ownership file..."
+  # --- [6/8] fix ownership -------------------------------------------------
+  log_info "[6/8] Memperbaiki ownership file..."
   if ! tools_fix_ownership "$new_app"; then
-    _clone_step_failed "$new_app" "[7/8] ownership" "tools_fix_ownership gagal"
+    _clone_step_failed "$new_app" "[6/8] ownership" "tools_fix_ownership gagal"
     return 1
   fi
-  log_action "clone_execute_one[${new_app}]: [7/8] ownership diperbaiki"
+  log_action "clone_execute_one[${new_app}]: [6/8] ownership diperbaiki"
+
+  # --- [7/8] wp search-replace domain lama -> domain baru ----------------
+  # SENGAJA dijalankan PALING AKHIR dari seluruh langkah "wajib berhasil"
+  # (bukan lagi di urutan [5/8] seperti versi sebelumnya) — sama seperti
+  # clone_execute_one_from_staging, lihat komentar di fungsi itu untuk
+  # detail investigasinya: siteurl/home yang sudah benar hasil
+  # search-replace terbukti bisa "kembali" ke domain lama pada saat dicek
+  # setelah seluruh pipeline (termasuk [8/8] non-blocking) selesai.
+  # Memindah search-replace ke akhir sekali (tepat sebelum blok
+  # non-blocking [8/8]) membuat nilai domainnya menjadi kata terakhir,
+  # terlepas dari apa pun yang terjadi di vhconf/listener/restart/ownership
+  # sebelum ini.
+  log_info "[7/8] wp search-replace domain lama -> domain baru (aman untuk data serialized)..."
+  local src_domain
+  src_domain="$(app_get "$src_app" DOMAIN)"
+  if [[ -z "$src_domain" ]]; then
+    _clone_step_failed "$new_app" "[7/8] search-replace" "domain app sumber tidak diketahui"
+    return 1
+  fi
+  _clone_wp_run "$new_docroot" cache flush >>"$WPM_LOG_FILE" 2>&1 \
+    || log_warn "clone_execute_one[${new_app}]: 'wp cache flush' gagal (non-fatal)"
+  if ! _clone_wp_run "$new_docroot" search-replace "$src_domain" "$new_domain" \
+        --all-tables --skip-columns=guid >>"$WPM_LOG_FILE" 2>&1; then
+    _clone_step_failed "$new_app" "[7/8] search-replace" "wp search-replace gagal"
+    return 1
+  fi
+  log_action "clone_execute_one[${new_app}]: [7/8] search-replace ${src_domain} -> ${new_domain} selesai"
 
   # ======================================================================
   # Steps 1-7 all succeeded — the app is live on HTTP from this point on.
@@ -907,11 +922,11 @@ staging_conf_set_all() {
 # outcome-reporting contract (CLONE_LAST_STATUS/CLONE_LAST_REASON,
 # _clone_validation_failed for [0/8], _clone_step_failed for steps 1-7), so
 # clone_wizard can render its final report identically regardless of which
-# of the two functions it called. Steps [2/8], [4/8], [7/8], [8/8] are
+# of the two functions it called. Steps [2/8], [4/8], [6/8], [8/8] are
 # byte-for-byte the same calls clone_execute_one makes (db_create_database/
 # db_create_user/db_grant_all, _patch_wp_config, tools_fix_ownership,
 # ssl_run_for_new_app + redis_create_acl_user + redis_sync_lscwp); steps
-# [1/8], [3/8], [5/8], [6/8] are staging-specific because there is no live
+# [1/8], [3/8], [5/8], [7/8] are staging-specific because there is no live
 # source app to rsync/dump/read a domain or vhconf from:
 #   [1/8] rsync $WPM_STAGE_DIR/STAGE_NAME/data/ -> docroot baru (bukan
 #         VH_ROOT app sumber)
@@ -919,13 +934,17 @@ staging_conf_set_all() {
 #   [3/8] impor berkas .sql/.sql.gz mentah lewat db_import_sql_file (bukan
 #         streaming mysqldump | mysql dari DB live)
 #   [4/8] patch wp-config.php (identik dengan clone_execute_one)
-#   [5/8] deteksi domain LAMA dari database yang baru diimpor sendiri
-#         (_clone_detect_old_domain), baru wp search-replace lama -> baru
-#         (tidak ada DOMAIN app sumber di registry untuk dibaca)
-#   [6/8] ols_rebuild_vhconf (men-generate vhconf minimal, karena tidak ada
+#   [5/8] ols_rebuild_vhconf (men-generate vhconf minimal, karena tidak ada
 #         vhconf sumber untuk disalin+dipatch) + blok virtualhost + listener
 #         map + restart graceful
-#   [7/8] fix ownership (identik dengan clone_execute_one)
+#   [6/8] fix ownership (identik dengan clone_execute_one)
+#   [7/8] deteksi domain LAMA dari database yang baru diimpor sendiri
+#         (_clone_detect_old_domain), baru wp search-replace lama -> baru
+#         (tidak ada DOMAIN app sumber di registry untuk dibaca). Sengaja
+#         PALING AKHIR di antara langkah "wajib berhasil" — lihat komentar
+#         di clone_execute_one untuk alasannya (siteurl/home yang sudah
+#         benar terbukti bisa "kembali" ke domain lama setelah [8/8]
+#         selesai, jadi search-replace dipindah jadi kata terakhir).
 #   [8/8] SSL + Redis ACL + sinkron LSCWP, non-blocking (identik dengan
 #         clone_execute_one)
 clone_execute_one_from_staging() {
@@ -1072,45 +1091,14 @@ clone_execute_one_from_staging() {
   fi
   log_action "clone_execute_one_from_staging[${new_app}]: [4/8] wp-config.php dipatch"
 
-  # Defensif — dan PENTING di jalur staging ini secara khusus: sumber
-  # staging sering kali sudah punya plugin cache (mis. LiteSpeed Cache)
-  # aktif lengkap dengan drop-in object-cache.php. Meski drop-in itu sudah
-  # di-exclude di [1/8] supaya tidak ikut tersalin (drop-in itu berisi
-  # konfigurasi cache milik environment SUMBER, bukan app baru ini), flush
-  # di sini tetap dilakukan sebagai lapisan pencegahan kedua — kalau
-  # sampai ada nilai ter-cache dari sebelum clone (mis. karena drop-in lain
-  # yang tidak ter-exclude), deteksi domain lama di [5/8] di bawah ini bisa
-  # salah baca nilai siteurl/home yang stale sehingga wp search-replace
-  # mencari string yang salah dan tidak mengganti apa pun (search-replace
-  # tetap exit 0 walau 0 baris diganti, jadi kegagalan seperti ini tidak
-  # akan pernah muncul sebagai [ERROR] — situs baru hanya akan diam-diam
-  # tetap redirect/menunjuk ke domain lama).
-  _clone_wp_run "$new_docroot" cache flush >>"$WPM_LOG_FILE" 2>&1 \
-    || log_warn "clone_execute_one_from_staging[${new_app}]: 'wp cache flush' gagal (non-fatal)"
-
-  # --- [5/8] deteksi domain lama dari data staging + search-replace ------
-  log_info "[5/8] Mendeteksi domain lama dari data staging & wp search-replace..."
-  local old_domain
-  old_domain="$(_clone_detect_old_domain "$new_docroot" "$new_db")"
-  if [[ -z "$old_domain" ]]; then
-    _clone_step_failed "$new_app" "[5/8] search-replace" "domain lama tidak terdeteksi dari data staging (periksa wp_options/siteurl di dump SQL)"
-    return 1
-  fi
-  if ! _clone_wp_run "$new_docroot" search-replace "$old_domain" "$new_domain" \
-        --all-tables --skip-columns=guid >>"$WPM_LOG_FILE" 2>&1; then
-    _clone_step_failed "$new_app" "[5/8] search-replace" "wp search-replace gagal"
-    return 1
-  fi
-  log_action "clone_execute_one_from_staging[${new_app}]: [5/8] search-replace ${old_domain} -> ${new_domain} selesai"
-
-  # --- [6/8] vhconf minimal + blok virtualhost + listener map + restart --
-  log_info "[6/8] Membuat vhconf, menambah virtualhost + listener, restart graceful..."
+  # --- [5/8] vhconf minimal + blok virtualhost + listener map + restart --
+  log_info "[5/8] Membuat vhconf, menambah virtualhost + listener, restart graceful..."
   if ! ols_rebuild_vhconf "$new_app"; then
-    _clone_step_failed "$new_app" "[6/8] vhconf" "gagal membuat vhconf untuk app baru '${new_app}'"
+    _clone_step_failed "$new_app" "[5/8] vhconf" "gagal membuat vhconf untuk app baru '${new_app}'"
     return 1
   fi
   if ! ols_write_vhost_block "$new_app" "$new_vh_root" "$(ols_vhconf_path "$new_app")"; then
-    _clone_step_failed "$new_app" "[6/8] vhconf" "gagal menulis blok virtualhost"
+    _clone_step_failed "$new_app" "[5/8] vhconf" "gagal menulis blok virtualhost"
     return 1
   fi
   # NOTE: sama seperti clone_execute_one, ols_write_listener_map mengembalikan
@@ -1120,22 +1108,50 @@ clone_execute_one_from_staging() {
   # menamakannya "Default", mis. listener bawaan "Example"), baru jatuh ke
   # literal "Default" bila memang tidak ada apa pun di port :80.
   if ! ols_write_listener_map "$(ols_http_listener_name)" "$new_app" "$new_domain"; then
-    _clone_step_failed "$new_app" "[6/8] vhconf" "gagal memetakan listener HTTP (:80)"
+    _clone_step_failed "$new_app" "[5/8] vhconf" "gagal memetakan listener HTTP (:80)"
     return 1
   fi
   if ! ols_graceful_restart; then
-    _clone_step_failed "$new_app" "[6/8] vhconf" "restart graceful OLS gagal"
+    _clone_step_failed "$new_app" "[5/8] vhconf" "restart graceful OLS gagal"
     return 1
   fi
-  log_action "clone_execute_one_from_staging[${new_app}]: [6/8] vhconf+virtualhost+listener+restart selesai"
+  log_action "clone_execute_one_from_staging[${new_app}]: [5/8] vhconf+virtualhost+listener+restart selesai"
 
-  # --- [7/8] fix ownership (identik dengan clone_execute_one) ------------
-  log_info "[7/8] Memperbaiki ownership file..."
+  # --- [6/8] fix ownership (identik dengan clone_execute_one) ------------
+  log_info "[6/8] Memperbaiki ownership file..."
   if ! tools_fix_ownership "$new_app"; then
-    _clone_step_failed "$new_app" "[7/8] ownership" "tools_fix_ownership gagal"
+    _clone_step_failed "$new_app" "[6/8] ownership" "tools_fix_ownership gagal"
     return 1
   fi
-  log_action "clone_execute_one_from_staging[${new_app}]: [7/8] ownership diperbaiki"
+  log_action "clone_execute_one_from_staging[${new_app}]: [6/8] ownership diperbaiki"
+
+  # --- [7/8] deteksi domain lama dari data staging + search-replace ------
+  # SENGAJA dijalankan PALING AKHIR dari seluruh langkah "wajib berhasil"
+  # (bukan lagi di urutan [5/8] seperti versi sebelumnya). Investigasi
+  # lapangan menunjukkan siteurl/home yang sudah benar hasil search-replace
+  # bisa "kembali" ke domain lama pada saat dicek setelah SELURUH pipeline
+  # (termasuk [8/8] non-blocking) selesai — walau tidak satu pun perintah
+  # wp-cli individual di [8/8] (plugin is-active / litespeed-option set /
+  # litespeed-purge) terbukti menyebabkannya saat diuji satu-satu secara
+  # terpisah. Daripada terus menebak mekanisme persisnya, search-replace
+  # dipindah jadi kata TERAKHIR sebelum blok non-blocking [8/8] — apa pun
+  # yang terjadi di langkah-langkah SEBELUM ini (vhconf/listener/restart/
+  # ownership) tidak lagi relevan terhadap domain akhir yang tersimpan.
+  log_info "[7/8] Mendeteksi domain lama dari data staging & wp search-replace..."
+  local old_domain
+  old_domain="$(_clone_detect_old_domain "$new_docroot" "$new_db")"
+  if [[ -z "$old_domain" ]]; then
+    _clone_step_failed "$new_app" "[7/8] search-replace" "domain lama tidak terdeteksi dari data staging (periksa wp_options/siteurl di dump SQL)"
+    return 1
+  fi
+  _clone_wp_run "$new_docroot" cache flush >>"$WPM_LOG_FILE" 2>&1 \
+    || log_warn "clone_execute_one_from_staging[${new_app}]: 'wp cache flush' gagal (non-fatal)"
+  if ! _clone_wp_run "$new_docroot" search-replace "$old_domain" "$new_domain" \
+        --all-tables --skip-columns=guid >>"$WPM_LOG_FILE" 2>&1; then
+    _clone_step_failed "$new_app" "[7/8] search-replace" "wp search-replace gagal"
+    return 1
+  fi
+  log_action "clone_execute_one_from_staging[${new_app}]: [7/8] search-replace ${old_domain} -> ${new_domain} selesai"
 
   # ======================================================================
   # Steps 1-7 all succeeded — the app is live on HTTP from this point on.
